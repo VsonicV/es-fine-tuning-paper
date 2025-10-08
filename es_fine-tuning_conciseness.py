@@ -106,12 +106,11 @@ def process_seed(seed_args):
     if verbose:
         print(f"Process {accelerator.process_index} Thread {thread_id} processing seed {seed_idx} (value: {seed})")
 
+    gen = torch.Generator(device=param.device)
+    gen.manual_seed(int(seed))
+    
     # Put load-evaluate-restore in the same lock block for thread safety
     for name, param in model.named_parameters():
-        gen = torch.Generator(device=param.device)
-
-        gen.manual_seed(int(seed))
-
         noise = torch.randn(
             param.shape,
             generator=gen,
@@ -131,12 +130,11 @@ def process_seed(seed_args):
                            seed_idx=seed_idx, thread_id=thread_id, verbose=verbose, return_text=False)
     total_reward = sum(rewards)
 
+    gen = torch.Generator(device=param.device)
+    gen.manual_seed(int(seed))
+    
     # Restore original weights (direct inplace modification)
     for name, param in model.named_parameters():
-        gen = torch.Generator(device=param.device)
-
-        gen.manual_seed(int(seed))
-
         noise = torch.randn(
             param.shape,
             generator=gen,
