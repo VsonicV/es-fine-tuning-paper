@@ -360,12 +360,6 @@ def main():
             model = base  # use full model
             
         model.eval()
-        # Optionally print trainable params once
-        # if accelerator.is_main_process and model_index == 0:
-        #     if args.use_lora:
-        #         model.print_trainable_parameters()
-        #     else:
-        #         print(f"Full model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
         model_list.append(model)
 
     if accelerator.is_main_process:
@@ -389,169 +383,146 @@ def main():
 
     np.random.seed(initial_seed)
 
+    # =====================================================================
+    # === REPLACED ES LOOP: mini-batch + batched generation per seed ======
+    # =====================================================================
+    original_model = model_list[0]
+
     for iteration in range(NUM_ITERATIONS):
-        # Record iteration start time
         iter_start_time = time.time()
 
-        # Force garbage collection
-        force_memory_cleanup()
-
-        if args.verbose:
-            print(f"Process {accelerator.process_index} starting iteration {iteration + 1}/{NUM_ITERATIONS}")
-
-        # Generate seeds on main process only
+        # Choose a mini-batch of questions (same across processes)
+        BATCH_SIZE = min(32, len(dataset))  # mini-batch size (kept local to this loop change)
         if accelerator.is_main_process:
-            if args.verbose:
-                print(f"Main process {accelerator.process_index} generating seeds")
+            batch_indices = torch.from_numpy(
+                np.random.choice(len(dataset), size=BATCH_SIZE, replace=False)
+            ).to(device=accelerator.device, dtype=torch.long)
+        else:
+            batch_indices = torch.zeros(BATCH_SIZE, device=accelerator.device, dtype=torch.long)
+
+        # Broadcast batch indices so all processes evaluate the same questions
+        if accelerator.num_processes > 1:
+            torch.distributed.broadcast(batch_indices, src=0)
+
+        batch_indices_list = batch_indices.cpu().tolist()
+        batch_texts   = [dataset[i][0] for i in batch_indices_list]
+        batch_targets = [dataset[i][1] for i in batch_indices_list]
+
+        # Generate seeds on main process and broadcast (as in original)
+        if accelerator.is_main_process:
             seeds = np.random.randint(0, 2**30, size=POPULATION_SIZE, dtype=np.int64).tolist()
             seeds_tensor = torch.tensor(seeds, device=accelerator.device)
         else:
-            if args.verbose:
-                print(f"Worker process {accelerator.process_index} waiting for seeds")
             seeds_tensor = torch.zeros(POPULATION_SIZE, dtype=torch.long, device=accelerator.device)
-
-        # Broadcast seeds from main process to all processes
         if accelerator.num_processes > 1:
             torch.distributed.broadcast(seeds_tensor, src=0)
-        seeds = seeds_tensor.cpu().tolist()  # Convert back to list for all processes
+        seeds = seeds_tensor.cpu().tolist()
 
-        if args.verbose:
-            print(f"Process {accelerator.process_index} received seeds")
-
-        # Assign seeds to each process for processing
+        # Assign seeds to each process (same policy as original)
         local_seeds = []
         for seed_idx, seed in enumerate(seeds):
-            # Simple task assignment: assign seeds by process ID
             if seed_idx % accelerator.num_processes == accelerator.process_index:
                 local_seeds.append((seed_idx, seed))
 
-        if args.verbose:
-            print(f"Process {accelerator.process_index} assigned {len(local_seeds)} seeds: {[idx for idx, _ in local_seeds]}")
+        # Prepare reward storage: [BATCH_SIZE, POPULATION_SIZE]
+        rewards_matrix_local = torch.zeros(BATCH_SIZE, POPULATION_SIZE, device=accelerator.device, dtype=torch.float32)
 
-        # Process seeds in smaller batches to reduce memory pressure
-        local_rewards = []
-        local_flops = []
-        batch_size = max(1, min(args.gpu_threads, len(local_seeds)))
+        # FLOPs tracking
+        iter_flops_local = 0.0
 
-        for batch_start in range(0, len(local_seeds), batch_size):
-            batch_end = min(batch_start + batch_size, len(local_seeds))
-            batch_seeds = local_seeds[batch_start:batch_end]
+        # Evaluate each local seed on the *batched* mini-batch
+        for (seed_idx, seed) in local_seeds:
+            # Apply noise to trainable params
+            for name, param in original_model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                gen = torch.Generator(device=param.device)
+                gen.manual_seed(int(seed))
+                noise = torch.randn(param.shape, generator=gen, device=param.device, dtype=param.dtype)
+                param.data.add_(SIGMA * noise)
 
-            with ThreadPoolExecutor(max_workers=len(batch_seeds)) as executor:
-                # Prepare thread arguments
-                thread_args = []
-                for thread_id, (seed_idx, seed) in enumerate(batch_seeds):
-                    # Pass verbose flag, track_flops, and num_params as arguments to process_seed function
-                    thread_args.append((seed_idx, seed, model_list[thread_id], tokenizer, accelerator, thread_id, args.verbose, dataset, args.track_flops, num_params))
+            # Batched evaluation (single generate() for all B prompts)
+            eval_result = evaluate_model(
+                original_model, tokenizer, batch_texts, batch_targets, accelerator,
+                seed_idx=seed_idx, thread_id=0, verbose=args.verbose, return_text=False,
+                track_flops=args.track_flops, num_params=num_params
+            )
+            if args.track_flops:
+                rewards_list, flops = eval_result
+                iter_flops_local += float(flops)
+            else:
+                rewards_list = eval_result
 
-                # Execute in parallel and collect results
-                results = list(executor.map(process_seed, thread_args))
-                
-                if args.track_flops:
-                    for seed_idx, reward, flops in results:
-                        local_rewards.append((seed_idx, reward))
-                        local_flops.append((seed_idx, flops))
-                else:
-                    local_rewards.extend(results)
+            # Fill local rewards column for this seed
+            rewards_tensor_seed = torch.tensor(rewards_list, device=accelerator.device, dtype=torch.float32)
+            rewards_matrix_local[:, seed_idx] = rewards_tensor_seed
 
-            # Clean up between batches
-            force_memory_cleanup()
+            # Restore original weights (subtract same noise)
+            for name, param in original_model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                gen = torch.Generator(device=param.device)
+                gen.manual_seed(int(seed))
+                noise = torch.randn(param.shape, generator=gen, device=param.device, dtype=param.dtype)
+                param.data.add_(-SIGMA * noise)
 
-        # Collect rewards from all processes
-        all_rewards = torch.zeros(POPULATION_SIZE, device=accelerator.device)
-
-        # Fill in locally computed rewards
-        for seed_idx, reward in local_rewards:
-            all_rewards[seed_idx] = reward
-
-        # Aggregate rewards from all processes (each process will get the full reward list)
+        # Aggregate rewards across processes into full [B, N]
         if accelerator.num_processes > 1:
-            torch.distributed.all_reduce(all_rewards, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(rewards_matrix_local, op=torch.distributed.ReduceOp.SUM)
+        rewards_matrix = rewards_matrix_local  # now holds global matrix since each seed is unique to one proc
 
-        # Convert aggregated rewards back to Python list
-        rewards = all_rewards.cpu().tolist()
-        # Clean up no longer needed tensor
-        del all_rewards
-        
-        # Collect FLOPs from all processes if tracking
-        iter_flops = 0
-        if args.track_flops:
-            all_flops = torch.zeros(POPULATION_SIZE, device=accelerator.device, dtype=torch.float64)
-            for seed_idx, flops in local_flops:
-                all_flops[seed_idx] = flops
-            
-            if accelerator.num_processes > 1:
-                torch.distributed.all_reduce(all_flops, op=torch.distributed.ReduceOp.SUM)
-            
-            iter_flops = all_flops.sum().item()
-            total_flops += iter_flops
-            del all_flops
-        
-        force_memory_cleanup()
+        # Z-score per question across seeds
+        means = rewards_matrix.mean(dim=1, keepdim=True)
+        stds  = rewards_matrix.std(dim=1, unbiased=False, keepdim=True).clamp_min(1e-8)
+        z = (rewards_matrix - means) / stds  # [B, N]
 
-        # Convert rewards to a tensor and normalize.
-        rewards_tensor = np.array(rewards, dtype=np.float32)
-        rewards_normalized = (rewards_tensor - rewards_tensor.mean()) / (rewards_tensor.std() + 1e-8)
+        # Average z across questions -> per-seed weight
+        z_avg = z.mean(dim=0)  # [N]
 
-        if args.verbose:
-            print(f"Process {accelerator.process_index} updating model weights")
-
-        # === ES update on trainable params (LoRA params if using LoRA, or all params if not) ===
-        original_model = model_list[0]
+        # ES parameter update using z_avg weights (regenerate noise once)
         for name, param in original_model.named_parameters():
             if not param.requires_grad:
                 continue
             gen = torch.Generator(device=param.device)
             update = torch.zeros_like(param)
-            for seed_idx in range(POPULATION_SIZE):
-                r_norm = rewards_normalized[seed_idx]
-                seed = seeds[seed_idx]
+            for seed_idx, seed in enumerate(seeds):
                 gen.manual_seed(int(seed))
-                noise = torch.randn(
-                    param.shape,
-                    generator=gen,
-                    device=param.device,
-                    dtype=param.dtype
-                )
-                update.add_(noise.mul(float(r_norm)))
-                del noise
+                noise = torch.randn(param.shape, generator=gen, device=param.device, dtype=param.dtype)
+                update.add_(noise.mul(float(z_avg[seed_idx].item())))
             update.div_(POPULATION_SIZE)
             param.data.add_(ALPHA * update)
             del update
             torch.cuda.empty_cache()
 
-        # Sync trainable params to sibling thread models
+        # Sync updated trainable params to sibling models (keep original behavior)
         for model_idx in range(1, len(model_list)):
             dst = model_list[model_idx]
-            # copy by name
             src_named = dict(original_model.named_parameters())
             for n_dst, p_dst in dst.named_parameters():
                 if p_dst.requires_grad:
                     p_dst.data.copy_(src_named[n_dst].data)
 
-        # Synchronize to ensure weight updates are complete
-        if torch.cuda.is_available():
-            torch.cuda.synchronize(accelerator.device)
+        # FLOPs aggregation
+        iter_flops = 0.0
+        if args.track_flops:
+            flops_tensor = torch.tensor(iter_flops_local, device=accelerator.device, dtype=torch.float64)
+            if accelerator.num_processes > 1:
+                torch.distributed.all_reduce(flops_tensor, op=torch.distributed.ReduceOp.SUM)
+            iter_flops = float(flops_tensor.item())
+            total_flops += iter_flops
 
-        force_memory_cleanup()
+        # Metrics over seeds (use per-seed mean reward across questions)
+        per_seed_means = rewards_matrix.mean(dim=0)  # [N]
+        mean_reward = float(per_seed_means.mean().item())
+        min_reward  = float(per_seed_means.min().item())
+        max_reward  = float(per_seed_means.max().item())
+        std_reward  = float(per_seed_means.std(unbiased=False).item())
 
         iter_time = time.time() - iter_start_time
-
-        mean_reward = rewards_tensor.mean().item()
-        min_reward = rewards_tensor.min().item()
-        max_reward = rewards_tensor.max().item()
-        std_reward = rewards_tensor.std().item()
-
-        del rewards_tensor, rewards_normalized
-        force_memory_cleanup()
-
         if accelerator.is_main_process:
-            flops_str = ""
-            if args.track_flops:
-                flops_str = f", FLOPs: {iter_flops/1e12:.2f}T"
+            flops_str = f", FLOPs: {iter_flops/1e12:.2f}T" if args.track_flops else ""
             print(f"Iteration {iteration + 1}/{NUM_ITERATIONS}, Time: {iter_time:.2f}s, Mean: {mean_reward:.2f}, Min: {min_reward:.2f}, Max: {max_reward:.2f}{flops_str}")
-            
-            # Log to wandb
+
             if args.use_wandb:
                 log_dict = {
                     "iteration": iteration + 1,
@@ -560,6 +531,7 @@ def main():
                     "reward/max": max_reward,
                     "reward/std": std_reward,
                     "time/iteration_seconds": iter_time,
+                    "batch/size": BATCH_SIZE,
                 }
                 if args.track_flops:
                     log_dict["compute/iteration_tflops"] = iter_flops / 1e12
@@ -569,13 +541,16 @@ def main():
                     log_dict["memory/gpu_allocated_mb"] = torch.cuda.memory_allocated() / 1024**2
                     log_dict["memory/gpu_peak_mb"] = torch.cuda.max_memory_allocated() / 1024**2
                 wandb.log(log_dict)
-            
+
             if torch.cuda.is_available():
                 print(f"GPU Memory: {torch.cuda.memory_allocated() / 1024**2:.2f}MB allocated, {torch.cuda.max_memory_allocated() / 1024**2:.2f}MB peak")
 
             # Save checkpoint every 100 iterations (adapters only)
             if (iteration + 1) % 100 == 0:
                 save_model_checkpoint(original_model, tokenizer, iteration + 1, model_name, initial_seed, args, len(dataset))
+
+        force_memory_cleanup()
+    # =====================================================================
 
     total_time = time.time() - training_start_time
 
