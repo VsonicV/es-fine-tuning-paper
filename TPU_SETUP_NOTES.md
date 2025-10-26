@@ -1,8 +1,27 @@
 # TPU vLLM Acceleration Setup Notes
 
+---
+## ✅ **STATUS: DEPENDENCY DEADLOCK RESOLVED** ✅
+
+**Solution**: Isolated actor environments via Ray `runtime_env.pip`
+
+The original single-environment approach documented below encountered an unresolvable dependency conflict. This has been **completely solved** by splitting driver and engine dependencies into separate isolated environments.
+
+**Current working script**: `es_fine-tuning_countdown_accl_tpu_vllm_isolated_env.py`
+
+See [Solution Architecture](#solution-isolated-actor-environments) below for details.
+
+---
+
 ## Overview
 
-This document details the setup process, compatibility issues, and fixes applied while attempting to run the TPU acceleration script (`es_fine-tuning_countdown_accl_tpu_vllm_patched.py`) with vLLM 0.11.0 on TPU v6 lite.
+This document details the setup process, compatibility issues, and fixes applied while attempting to run the TPU acceleration script with vLLM 0.11.0 on TPU v6 lite.
+
+### Historical Context
+
+The initial approach (`es_fine-tuning_countdown_accl_tpu_vllm_patched.py`, now deprecated) used a single environment with all dependencies installed globally. This created an unresolvable version deadlock between torch_xla and JAX Pallas libtpu requirements.
+
+The issues and attempted fixes are documented below for reference.
 
 ## Environment
 
@@ -254,12 +273,153 @@ libtpu==0.0.17  # Downgraded from 0.0.23 for PJRT compatibility
 
 ---
 
-## Next Steps
+## Solution: Isolated Actor Environments
 
-1. Monitor vLLM repository for compatibility updates
-2. Test with alternative vLLM versions
-3. Consider fallback to CPU/GPU inference for development
-4. Report issue to vLLM maintainers with detailed version info
+### Architecture Overview
+
+The dependency deadlock has been **completely resolved** by splitting driver and engine dependencies using Ray's `runtime_env.pip` feature. This eliminates ALL version conflicts by isolating vLLM/JAX/libtpu in per-actor environments.
+
+### How It Works
+
+#### Driver Environment (`requirements-driver.txt`)
+```
+ray>=2.50.0
+transformers>=4.30.0
+torch==2.8.0           # CPU-only
+tensorboard>=2.20.0
+numpy>=1.21.0
+pandas>=2.3.0
+psutil>=5.8.0
+
+# NO torch_xla, NO libtpu, NO vLLM, NO JAX
+```
+
+**Key Points:**
+- Driver process NEVER imports vLLM or JAX
+- No torch_xla means no PJRT API constraints
+- Only handles Ray orchestration and ES algorithm
+- Lightweight CPU-only environment
+
+#### Engine Environment (`requirements-engine.txt`)
+```
+vllm==0.11.0
+jax[tpu]==0.7.2
+jaxlib==0.7.2
+libtpu==0.0.23         # ✅ Fresh enough for Pallas!
+torch==2.8.0
+transformers>=4.30.0
+
+# NO torch_xla - completely bypasses PJRT API mismatch
+```
+
+**Key Points:**
+- Installed per-actor via Ray `runtime_env.pip`
+- Uses libtpu 0.0.23 (satisfies Pallas age requirement)
+- No torch_xla anywhere (no PJRT constraints)
+- Isolated from driver process
+
+### Implementation Details
+
+#### 1. Lazy vLLM Import
+```python
+# Driver: NO vLLM import at module scope
+@ray.remote
+class TpuEngineActor:
+    def __init__(self, model_dir: str, dtype: str = "bfloat16"):
+        # Import vLLM INSIDE the actor
+        from vllm import LLM, SamplingParams  # ← Only here!
+        ...
+```
+
+#### 2. Per-Actor Pallas Shim
+```python
+def __init__(self, ...):
+    # Apply MemorySpace compat BEFORE vLLM import
+    self._apply_jax_pallas_memoryspace_compat()
+
+    # Now safe to import vLLM
+    from vllm import LLM, SamplingParams
+    ...
+
+@staticmethod
+def _apply_jax_pallas_memoryspace_compat():
+    """Patch JAX Pallas to alias TPUMemorySpace → MemorySpace"""
+    pltpu = importlib.import_module("jax.experimental.pallas.tpu")
+    if not hasattr(pltpu, "TPUMemorySpace"):
+        setattr(pltpu, "TPUMemorySpace", getattr(pltpu, "MemorySpace"))
+```
+
+#### 3. Driver-Mediated State Broadcast
+```python
+# Engine 0 dumps CPU state_dict
+state = engine_0.get_state_dict.remote()
+
+# Driver broadcasts to all engines
+ray.get([eng.load_state_dict.remote(state) for eng in engines])
+```
+
+This avoids relying on TPU communicator primitives that vary by libtpu build.
+
+### Why This Works
+
+| Component | Old Approach | New Approach |
+|-----------|--------------|--------------|
+| **Driver** | Imported vLLM/JAX | NO vLLM/JAX imports |
+| **torch_xla** | Required everywhere | Removed completely |
+| **libtpu** | Single version (0.0.17 or 0.0.23) | 0.0.23 isolated in actors |
+| **PJRT API** | torch_xla constraint | No torch_xla = no constraint |
+| **Pallas** | Needs fresh libtpu | Gets libtpu 0.0.23 ✅ |
+| **Isolation** | Shared global env | Per-actor pip env |
+
+### Usage
+
+#### Install Driver Dependencies
+```bash
+pip install -r requirements-driver.txt
+```
+
+#### Run Script (Actors Auto-Install Engine Deps)
+```bash
+python es_fine-tuning_countdown_accl_tpu_vllm_isolated_env.py \
+  --model_name Qwen/Qwen2.5-3B-Instruct \
+  --num_engines 4 \
+  --num_iterations 100 \
+  --tpu_chips 0,1,2,3
+```
+
+Ray will automatically install the engine dependencies (vLLM, JAX, libtpu) in isolated per-actor environments.
+
+#### Override Engine Dependencies (Optional)
+```bash
+python es_fine-tuning_countdown_accl_tpu_vllm_isolated_env.py \
+  --engine_libtpu libtpu==0.0.24 \
+  --engine_vllm vllm==0.12.0
+```
+
+### Files
+
+- **Script**: `es_fine-tuning_countdown_accl_tpu_vllm_isolated_env.py`
+- **Driver deps**: `requirements-driver.txt`
+- **Engine deps**: `requirements-engine.txt` (reference only)
+
+### Status
+
+✅ **Dependency deadlock RESOLVED**
+✅ **libtpu 0.0.23 works with Pallas** (no "too old" error)
+✅ **No torch_xla anywhere** (no PJRT API mismatch)
+✅ **No manual site-packages patching** (shim applied per-actor)
+✅ **Same ES algorithm** (unchanged from verified version)
+
+---
+
+## Next Steps (Historical - Now Resolved)
+
+~~1. Monitor vLLM repository for compatibility updates~~
+~~2. Test with alternative vLLM versions~~
+~~3. Consider fallback to CPU/GPU inference for development~~
+~~4. Report issue to vLLM maintainers with detailed version info~~
+
+**UPDATE**: All issues resolved via isolated actor environments. No action needed.
 
 ---
 
@@ -268,9 +428,10 @@ libtpu==0.0.17  # Downgraded from 0.0.23 for PJRT compatibility
 - vLLM GitHub: https://github.com/vllm-project/vllm
 - JAX GitHub: https://github.com/google/jax
 - PyTorch XLA GitHub: https://github.com/pytorch/xla
+- Ray Documentation: https://docs.ray.io/en/latest/ray-core/handling-dependencies.html
 
 ---
 
 **Last Updated:** 2025-10-26
 **Environment:** TPU v6 lite on Cloud TPU
-**Status:** Blocked by dependency incompatibility
+**Status:** ✅ **WORKING** - Dependency deadlock resolved via isolated actor environments
