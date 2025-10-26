@@ -3,7 +3,7 @@
 vllm==0.11.0
 jax[tpu]==0.7.2
 jaxlib==0.7.2
-libtpu==0.0.23
+libtpu==0.0.27  # Latest version (satisfies Pallas "< 1 month old" requirement)
 torch==2.8.0
 transformers>=4.30.0
 numpy>=1.21.0

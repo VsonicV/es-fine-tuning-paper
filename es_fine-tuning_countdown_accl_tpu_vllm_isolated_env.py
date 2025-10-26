@@ -45,7 +45,7 @@ def parse_args():
     p.add_argument("--engine_vllm", type=str, default="vllm==0.11.0")
     p.add_argument("--engine_jax", type=str, default="jax[tpu]==0.7.2")
     p.add_argument("--engine_jaxlib", type=str, default="jaxlib==0.7.2")
-    p.add_argument("--engine_libtpu", type=str, default="libtpu==0.0.23")
+    p.add_argument("--engine_libtpu", type=str, default="libtpu==0.0.27")  # Latest (Oct 2025)
     p.add_argument("--engine_torch", type=str, default="torch==2.8.0")
     p.add_argument("--engine_transformers", type=str, default="transformers>=4.30.0")
     p.add_argument("--engine_numpy", type=str, default="numpy>=1.21.0")
