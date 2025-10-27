@@ -25,8 +25,8 @@ parser.add_argument('--precision', type=str, default='bf16')
 parser.add_argument('--gpu_threads', type=int, default=4, help='Number of parallel threads per GPU')
 parser.add_argument('--verbose', action='store_true', help='Print verbose logs')
 parser.add_argument('--data_sample', type=int, default=1000, help='Number of data samples to use for training')
+parser.add_argument('--llm_gen_batch_size', type=int, default=16, help='Number of batch_size for llm geneartion for training')
 args = parser.parse_args()
-
 
 # Hyperparameters for ES
 NUM_ITERATIONS = 1000             # Number of ES iterations (generations)
@@ -60,7 +60,7 @@ def save_model_checkpoint(model, tokenizer, iteration, model_name, initial_seed,
     tokenizer.save_pretrained(save_dir)
     print(f"Checkpoint saved successfully.")
 
-def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_idx=None, thread_id=None, verbose=False, return_text=False):
+def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_idx=None, thread_id=None, verbose=False, batch_size=16, return_text=False):
     """
     Generate a response from the model given an input (single or batch) and compute rewards.
     """
@@ -73,13 +73,22 @@ def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_
     target_texts = target_text if is_batch else [target_text]
 
     # Batch tokenization
-    tokenized_inputs = tokenizer(input_texts, return_tensors="pt", padding=True, padding_side="left")
-    input_ids = tokenized_inputs["input_ids"].to(accelerator.device)
-    attention_mask = tokenized_inputs["attention_mask"].to(accelerator.device)
-    with torch.inference_mode():
-        outputs = model.generate(input_ids, attention_mask=attention_mask, max_new_tokens=max_new_tokens, do_sample=do_sample)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize(accelerator.device)
+    sample_num = len(input_texts)
+    outputs = []
+    for idx in range(0, sample_num, batch_size):
+      tmp_input_texts = input_texts[idx:idx+batch_size]
+      tokenized_inputs = tokenizer(tmp_input_texts, return_tensors="pt", padding=True, padding_side="left")
+      input_ids = tokenized_inputs["input_ids"].to(accelerator.device)
+      attention_mask = tokenized_inputs["attention_mask"].to(accelerator.device)
+      with torch.inference_mode():
+          tmp_outputs = model.generate(input_ids, 
+                        attention_mask=attention_mask, 
+                        max_new_tokens=max_new_tokens, 
+                        do_sample=do_sample
+                )
+          outputs.extend(tmp_outputs)
+          if torch.cuda.is_available():
+              torch.cuda.synchronize(accelerator.device)
 
     # Decode batch outputs
     generated_texts = []
@@ -127,7 +136,7 @@ def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_
 
 def process_seed(seed_args):
     """Function to process a single seed, used for thread pool"""
-    seed_idx, seed, model, tokenizer, accelerator, thread_id, verbose, dataset = seed_args
+    seed_idx, seed, model, tokenizer, accelerator, thread_id, verbose, dataset, batch_size = seed_args
 
     if verbose:
         print(f"Process {accelerator.process_index} Thread {thread_id} processing seed {seed_idx} (value: {seed})")
@@ -154,7 +163,7 @@ def process_seed(seed_args):
     input_texts = [input_text for input_text, _ in dataset]
     target_texts = [target_text for _, target_text in dataset]
     rewards = evaluate_model(model, tokenizer, input_texts, target_texts, accelerator,
-                           seed_idx=seed_idx, thread_id=thread_id, verbose=verbose, return_text=False)
+                           seed_idx=seed_idx, thread_id=thread_id, verbose=verbose, batch_size=batch_size, return_text=False)
     total_reward = sum(rewards)
 
     # Restore original weights (direct inplace modification)
@@ -299,7 +308,7 @@ def main():
                 thread_args = []
                 for thread_id, (seed_idx, seed) in enumerate(batch_seeds):
                     # Pass verbose flag as argument to process_seed function
-                    thread_args.append((seed_idx, seed, model_list[thread_id], tokenizer, accelerator, thread_id, args.verbose, dataset))
+                    thread_args.append((seed_idx, seed, model_list[thread_id], tokenizer, accelerator, thread_id, args.verbose, dataset, args.llm_gen_batch_size))
 
                 # Execute in parallel and collect results
                 results = list(executor.map(process_seed, thread_args))
