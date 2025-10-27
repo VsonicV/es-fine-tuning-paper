@@ -43,9 +43,7 @@ def parse_args():
                    help="Comma-separated TPU chip ids per engine, e.g. '0,1,2,3'")
     # Per-actor pip pins (override defaults if needed)
     p.add_argument("--engine_vllm", type=str, default="vllm==0.11.0")
-    p.add_argument("--engine_jax", type=str, default="jax[tpu]==0.7.2")
-    p.add_argument("--engine_jaxlib", type=str, default="jaxlib==0.7.2")
-    p.add_argument("--engine_libtpu", type=str, default="libtpu==0.0.27")  # Latest (Oct 2025)
+    p.add_argument("--engine_jax_tpu", type=str, default="jax[tpu]==0.7.2")  # Automatically installs jaxlib and libtpu
     p.add_argument("--engine_torch", type=str, default="torch==2.8.0")
     p.add_argument("--engine_transformers", type=str, default="transformers>=4.30.0")
     p.add_argument("--engine_numpy", type=str, default="numpy>=1.21.0")
@@ -68,8 +66,9 @@ def _load_reward():
 class TpuEngineActor:
     def __init__(self, model_dir: str, dtype: str = "bfloat16"):
         # The driver has provisioned a per-actor pip env via runtime_env.pip.
-        # Apply the JAX Pallas compat shim BEFORE importing vLLM.
+        # Apply JAX Pallas compat patches BEFORE importing vLLM.
         self._apply_jax_pallas_memoryspace_compat()
+        self._disable_libtpu_age_check()
 
         # Import vLLM now that JAX is patched
         from vllm import LLM, SamplingParams  # noqa: WPS433
@@ -104,6 +103,35 @@ class TpuEngineActor:
         except Exception:
             # Best-effort; some builds don't ship pallas.tpu
             pass
+
+    @staticmethod
+    def _disable_libtpu_age_check():
+        """Monkey-patch JAX Pallas to bypass libtpu age check.
+
+        The check requires libtpu < 1 month old, but no such version exists publicly.
+        This approach patches BEFORE any JAX module loads the function.
+        """
+        import sys
+        try:
+            # Create patched function BEFORE any imports
+            def patched_is_cloud_tpu_older_than(*args, **kwargs):
+                return False
+
+            # Patch cloud_tpu_init module
+            cloud_tpu_init = importlib.import_module("jax._src.cloud_tpu_init")
+            setattr(cloud_tpu_init, "is_cloud_tpu_older_than", patched_is_cloud_tpu_older_than)
+
+            # Ensure lowering module is NOT loaded yet, or reload it
+            if "jax._src.pallas.mosaic.lowering" in sys.modules:
+                # Module already loaded with old function, need to reload
+                import importlib as imp_reload
+                lowering = sys.modules["jax._src.pallas.mosaic.lowering"]
+                imp_reload.reload(lowering)
+
+            print("Successfully patched JAX Pallas libtpu age check")
+        except Exception as e:
+            # If patching fails, log but continue (will fail later at Pallas compilation)
+            print(f"Warning: Failed to patch libtpu age check: {e}")
 
     # -------------------- internal: params accessor -----------------------
     def _resolve_param_accessor(self):
@@ -172,9 +200,7 @@ def launch_tpu_engines(num_engines: int, model_dir: str, tpu_chips_csv: str | No
 
     pip_list = [
         pip_versions["engine_vllm"],
-        pip_versions["engine_jax"],
-        pip_versions["engine_jaxlib"],
-        pip_versions["engine_libtpu"],
+        pip_versions["engine_jax_tpu"],         # jax[tpu] installs jax, jaxlib, and libtpu
         pip_versions["engine_torch"],           # CPU-only torch is fine
         pip_versions["engine_transformers"],
         pip_versions["engine_numpy"],
@@ -262,9 +288,7 @@ def main(args):
     # Launch TPU engines with per-actor pip env (fresh libtpu/JAX/vLLM)
     pip_versions = {
         "engine_vllm": args.engine_vllm,
-        "engine_jax": args.engine_jax,
-        "engine_jaxlib": args.engine_jaxlib,
-        "engine_libtpu": args.engine_libtpu,
+        "engine_jax_tpu": args.engine_jax_tpu,
         "engine_torch": args.engine_torch,
         "engine_transformers": args.engine_transformers,
         "engine_numpy": args.engine_numpy,

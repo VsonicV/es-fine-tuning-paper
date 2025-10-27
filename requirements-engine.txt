@@ -1,12 +1,11 @@
 # Reference list for the per-actor pip runtime_env (TPU engines)
 # These are installed automatically by the script under runtime_env.pip.
 vllm==0.11.0
-jax[tpu]==0.7.2
-jaxlib==0.7.2
-libtpu==0.0.27  # Latest version (satisfies Pallas "< 1 month old" requirement)
+jax[tpu]==0.7.2  # Automatically installs compatible jax, jaxlib, and libtpu versions
 torch==2.8.0
 transformers>=4.30.0
 numpy>=1.21.0
 tensorboard>=2.20.0
 psutil>=5.8.0
-# NO torch_xla in the engine env.
+# NO torch_xla in the engine env (avoids PJRT API mismatch)
+# NO separate jaxlib or libtpu - jax[tpu] installs them automatically
