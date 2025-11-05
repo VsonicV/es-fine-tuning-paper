@@ -1,6 +1,7 @@
 """
 ES fine tuning of LLMs
 """
+
 import argparse
 import gc
 import os
@@ -78,9 +79,7 @@ def parse_args():
         default="bf16",
         help="Format for representing floating-point numbers",
     )
-    parser.add_argument(
-        "--gpu_threads", type=int, default=4, help="Number of parallel threads per GPU"
-    )
+    parser.add_argument("--gpu_threads", type=int, default=4, help="Number of parallel threads per GPU")
     parser.add_argument("--verbose", action="store_true", help="Print verbose logs")
     args = parser.parse_args()
 
@@ -120,8 +119,7 @@ def force_memory_cleanup():
         torch.cuda.synchronize()
 
 
-
-def evaluate_model( # pylint: disable=too-many-arguments, disable=too-many-positional-arguments, disable=too-many-locals
+def evaluate_model(  # pylint: disable=too-many-arguments,disable=too-many-positional-arguments,disable=too-many-locals
     model,
     tokenizer: AutoTokenizer,
     input_text: str | list[str],
@@ -136,9 +134,7 @@ def evaluate_model( # pylint: disable=too-many-arguments, disable=too-many-posit
     Generate a response from the model given an input (single or batch) and compute the rewards.
     """
     if verbose:
-        print(
-            f"Process {accelerator.process_index} Thread {thread_id} evaluating seed {seed_idx}"
-        )
+        print(f"Process {accelerator.process_index} Thread {thread_id} evaluating seed {seed_idx}")
 
     # Handle both single input and batch input
     #
@@ -149,9 +145,7 @@ def evaluate_model( # pylint: disable=too-many-arguments, disable=too-many-posit
     target_texts = target_text if is_batch else [target_text]
 
     # Batch tokenization
-    tokenized_inputs = tokenizer(
-        input_texts, return_tensors="pt", padding=True, padding_side="left"
-    )
+    tokenized_inputs = tokenizer(input_texts, return_tensors="pt", padding=True, padding_side="left")
     input_ids = tokenized_inputs["input_ids"].to(accelerator.device)
     attention_mask = tokenized_inputs["attention_mask"].to(accelerator.device)
 
@@ -176,9 +170,7 @@ def evaluate_model( # pylint: disable=too-many-arguments, disable=too-many-posit
             # If we encounter an error, manually reconstruct the text in a more cautious way
 
             # Map numeric IDs to their string tokens (e.g., "hello", "world", etc.).
-            tokens = tokenizer.convert_ids_to_tokens(
-                outputs[i], skip_special_tokens=True
-            )
+            tokens = tokenizer.convert_ids_to_tokens(outputs[i], skip_special_tokens=True)
             # Sometimes tokenization can produce None entries — this filters them out.
             filtered = [t for t in tokens if t is not None]
 
@@ -191,24 +183,19 @@ def evaluate_model( # pylint: disable=too-many-arguments, disable=too-many-posit
     torch.cuda.empty_cache()
 
     # Compute rewards for batch texts
-    rewards = [
-        compute_reward(gen_text, tgt_text)
-        for gen_text, tgt_text in zip(generated_texts, target_texts)
-    ]
+    rewards = [compute_reward(gen_text, tgt_text) for gen_text, tgt_text in zip(generated_texts, target_texts)]
 
     if return_text:
         return rewards, generated_texts
     return rewards
 
 
-def process_seed(seed_args): # pylint: disable=too-many-locals
+def process_seed(seed_args):  # pylint: disable=too-many-locals
     """Function to process a single seed, used for thread pool"""
     seed_idx, seed, model, tokenizer, accelerator, thread_id, verbose = seed_args
 
     if verbose:
-        print(
-            f"Process {accelerator.process_index} Thread {thread_id} processing seed {seed_idx} (value: {seed})"
-        )
+        print(f"Process {accelerator.process_index} Thread {thread_id} processing seed {seed_idx} (value: {seed})")
 
     # Weight perturbation
     for _, param in model.named_parameters():
@@ -218,9 +205,7 @@ def process_seed(seed_args): # pylint: disable=too-many-locals
         # Set the random seed for random number generator
         gen.manual_seed(int(seed))
 
-        noise = torch.randn(
-            param.shape, generator=gen, device=param.device, dtype=param.dtype
-        )
+        noise = torch.randn(param.shape, generator=gen, device=param.device, dtype=param.dtype)
 
         # Add noise directly to a model parameter’s data in-place — modifying it's tensor values
         # param.data accesses the raw tensor data of the parameter without gradient tracking
@@ -256,9 +241,7 @@ def process_seed(seed_args): # pylint: disable=too-many-locals
 
         gen.manual_seed(int(seed))
 
-        noise = torch.randn(
-            param.shape, generator=gen, device=param.device, dtype=param.dtype
-        )
+        noise = torch.randn(param.shape, generator=gen, device=param.device, dtype=param.dtype)
         param.data.add_(-SIGMA * noise)
 
     if torch.cuda.is_available():
@@ -278,7 +261,7 @@ def process_seed(seed_args): # pylint: disable=too-many-locals
     return seed_idx, average_reward
 
 
-def main(args): # pylint: disable=too-many-locals, too-many-branches, too-many-statements
+def main(args):  # pylint: disable=too-many-locals, too-many-branches, too-many-statements
     """
     Main Evolution Strategies Loop
     """
@@ -296,9 +279,7 @@ def main(args): # pylint: disable=too-many-locals, too-many-branches, too-many-s
     # 2) Save checkpoints or models
     # 3) Write to TensorBoard / WandB / files
     if accelerator.is_main_process:
-        print(
-            f"Total processes: {accelerator.num_processes}, GPU threads per process: {args.gpu_threads}"
-        )
+        print(f"Total processes: {accelerator.num_processes}, GPU threads per process: {args.gpu_threads}")
         print(f"Population size: {POPULATION_SIZE}, Iterations: {NUM_ITERATIONS}")
         print(f"Sigma: {SIGMA}, Alpha: {ALPHA}")
 
@@ -329,9 +310,7 @@ def main(args): # pylint: disable=too-many-locals, too-many-branches, too-many-s
         )
 
     # Load tokenizer. Use the slow (Python) version of the tokenizer instead of the fast (Rust-backed) one
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name, use_fast=False, cache_dir=hf_cache_dir
-    )
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False, cache_dir=hf_cache_dir)
 
     if accelerator.is_main_process:
         print("Model loaded successfully")
@@ -355,25 +334,19 @@ def main(args): # pylint: disable=too-many-locals, too-many-branches, too-many-s
         force_memory_cleanup()
 
         if args.verbose:
-            print(
-                f"Process {accelerator.process_index} starting iteration {iteration + 1}/{NUM_ITERATIONS}"
-            )
+            print(f"Process {accelerator.process_index} starting iteration {iteration + 1}/{NUM_ITERATIONS}")
 
         # Generate seeds on main process only
         if accelerator.is_main_process:
             if args.verbose:
                 print(f"Main process {accelerator.process_index} generating seeds")
-            seeds = np.random.randint(
-                0, 2**30, size=POPULATION_SIZE, dtype=np.int64
-            ).tolist()
+            seeds = np.random.randint(0, 2**30, size=POPULATION_SIZE, dtype=np.int64).tolist()
             seeds_tensor = torch.tensor(seeds, device=accelerator.device)
         else:
             if args.verbose:
                 print(f"Worker process {accelerator.process_index} waiting for seeds")
             # XX Why torch.long and not np.int64?
-            seeds_tensor = torch.zeros(
-                POPULATION_SIZE, dtype=torch.long, device=accelerator.device
-            )
+            seeds_tensor = torch.zeros(POPULATION_SIZE, dtype=torch.long, device=accelerator.device)
 
         # Broadcast seeds from main process to all processes
         # Checks if the training is running on more than one process — meaning distributed or multi-GPU training.
@@ -463,9 +436,7 @@ def main(args): # pylint: disable=too-many-locals, too-many-branches, too-many-s
 
         # Convert rewards to a tensor and normalize.
         rewards_tensor = np.array(rewards, dtype=np.float32)
-        rewards_normalized = (rewards_tensor - rewards_tensor.mean()) / (
-            rewards_tensor.std() + 1e-8
-        )
+        rewards_normalized = (rewards_tensor - rewards_tensor.mean()) / (rewards_tensor.std() + 1e-8)
 
         # Aggregate perturbations and update model weights
         if args.verbose:
@@ -481,9 +452,7 @@ def main(args): # pylint: disable=too-many-locals, too-many-branches, too-many-s
                 seed = seeds[seed_idx]
                 gen.manual_seed(int(seed))
 
-                noise = torch.randn(
-                    param.shape, generator=gen, device=param.device, dtype=param.dtype
-                )
+                noise = torch.randn(param.shape, generator=gen, device=param.device, dtype=param.dtype)
                 noise.mul_(float(r_norm))
                 update.add_(noise)
                 del noise

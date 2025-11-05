@@ -91,6 +91,11 @@ python es_fine-tuning_countdown_accl.py \
 
 On preliminary 4xH100 setting, accelerated version achieves ~10 times speed-up with similar convergence rate.
 
+## Contributing to the repository
+
+If you would like to contribute to this repository, please follow these [steps](./docs/README_contributing.md)
+to make sure your code is in the proper format and is free of lint errors.
+
 ## Citation
 
 If you find this work helpful in your research, please cite:
