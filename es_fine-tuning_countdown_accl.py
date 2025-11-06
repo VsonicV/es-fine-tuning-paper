@@ -4,6 +4,7 @@ import json
 import os
 import random
 import shutil
+
 # signal module lets your program handle Unix-style signals — special messages that the
 # operating system (or other processes) send to a running program to tell it to do something
 # (like stop, pause, reload, or clean up before exiting)
@@ -15,6 +16,7 @@ from typing import List
 from typing import Tuple
 
 import numpy as np
+
 # ray module is a distributed computing framework for Python. It lets you parallelize
 # and scale functions, classes, and workflows across CPUs, GPUs, and multiple machines
 import ray
@@ -25,6 +27,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM
 from transformers import AutoTokenizer
+
 # vLLM is a fast LLM inference engine designed to serve large transformer models efficiently,
 # often achieving 2–4× higher throughput than traditional frameworks such as PyTorch or Hugging
 # Face Transformers in standard inference setups
@@ -46,23 +49,37 @@ EXPERIMENT_DIR = "es-ft-experiment"
 CUDA_DEVICES = "0,1,2,3"
 TRAINING_DATA_PATH = "countdown/data/countdown.json"
 NUMBER_OF_TRAINING_DATA = 200
+SEED_LOWER_BOUND = 0
+SEED_UPPER_BOUND = 1_000_000
+SAMPLING_TEMPERATURE = (0.0,)
+SAMPLING_SEED = (42,)
+SAMPLING_MAX_TOKENS = (1024,)
 
 
 def parse_args() -> argparse.Namespace:
     """
     Parse command line arguments and return them
     """
-    parser = argparse.ArgumentParser(
-        description="ES Fine-tuning for Countdown Task with multi-engine NCCL sync"
-    )
+    parser = argparse.ArgumentParser(description="ES Fine-tuning for Countdown Task with multi-engine NCCL sync")
 
     parser.add_argument("--model_name", type=str, default=MODEL_NAME, help="Name of the model to fine-tune")
-    parser.add_argument("--sigma", type=float, default=SIGMA, help="Standard deviation for weight perturbations (noise scale)")
+    parser.add_argument(
+        "--sigma", type=float, default=SIGMA, help="Standard deviation for weight perturbations (noise scale)"
+    )
     parser.add_argument("--alpha", type=float, default=ALPHA, help="Learning rate")
-    parser.add_argument("--population_size", type=int, default=POPULATION_SIZE, help="Population size (number of perturbations per iteration)")
+    parser.add_argument(
+        "--population_size",
+        type=int,
+        default=POPULATION_SIZE,
+        help="Population size (number of perturbations per iteration)",
+    )
     parser.add_argument("--num_engines", type=int, default=NUM_ENGINES, help="")
-    parser.add_argument("--num_iterations", type=int, default=NUM_ITERATIONS, help="Number of ES iterations (generations)")
-    parser.add_argument("--experiment_dir", type=str, default=EXPERIMENT_DIR, help="Directory for log files, saved models, etc.")
+    parser.add_argument(
+        "--num_iterations", type=int, default=NUM_ITERATIONS, help="Number of ES iterations (generations)"
+    )
+    parser.add_argument(
+        "--experiment_dir", type=str, default=EXPERIMENT_DIR, help="Directory for log files, saved models, etc."
+    )
     parser.add_argument("--cuda_devices", type=str, default=CUDA_DEVICES, help="GPU indices")
     parser.add_argument("--verbose", action="store_true", help="Print verbose logs")
     parser.add_argument(
@@ -106,8 +123,9 @@ class ESNcclLLM(LLM):
         super().__init__(*args, **kwargs)
 
 
-def launch_engines(num_engines: int, model_name: str) -> Tuple[List[ray.actor.ActorHandle],
-                                                               List[ray.util.placement_group.PlacementGroup]]:
+def launch_engines(
+    num_engines: int, model_name: str
+) -> Tuple[List[ray.actor.ActorHandle], List[ray.util.placement_group.PlacementGroup]]:
     # Create a list of Ray placement groups (PGs), each reserving 1 GPU (and 0 CPUs)
     pgs = [
         # In Ray, a PG is a way to pre-reserve cluster resources. Think of it as a resource container
@@ -145,9 +163,7 @@ def launch_engines(num_engines: int, model_name: str) -> Tuple[List[ray.actor.Ac
     engines = [
         # ray.remote() marks a class/function to run remotely on the Ray cluster — not on the local Python process
         # Request 0 CPUs/GPUs as the allocation is already controlled by the placement group
-        ray.remote(num_cpus=0, num_gpus=0, scheduling_strategy=strategy)(
-            ESNcclLLM
-        ).remote(
+        ray.remote(num_cpus=0, num_gpus=0, scheduling_strategy=strategy)(ESNcclLLM).remote(
             # remote() creates an instance of remote actor —> actually launches ESNcclLLM process on the Ray cluster
             # All the keyword arguments below are passed to the actor’s __init__ method
             # The model name or path to load
@@ -171,25 +187,28 @@ def launch_engines(num_engines: int, model_name: str) -> Tuple[List[ray.actor.Ac
     return engines, pgs
 
 
-def evaluate_countdown_handle(llm, task_datas):
-    prompts = [d["context"] for d in task_datas]
+def evaluate_countdown_handle(llm, task_data):
+    prompts = [data["context"] for data in task_data]
+
     sampling_params = SamplingParams(
-        temperature=0.0,
-        seed=42,
-        max_tokens=1024,
+        temperature=SAMPLING_TEMPERATURE,
+        seed=SAMPLING_SEED,
+        max_tokens=SAMPLING_MAX_TOKENS,
     )
     handle = llm.generate.remote(prompts, sampling_params, use_tqdm=False)
     return handle, time.time()
 
 
-def _postprocess_outputs(outputs, task_datas):
+def _postprocess_outputs(outputs, task_data):
     rewards = []
     avg_rewards = []
-    for output, data in zip(outputs, task_datas):
+
+    for output, data in zip(outputs, task_data):
         response = output.outputs[0].text
-        r = reward_function(response, data["numbers"], data["target"])
-        rewards.append(r)
-        avg_rewards.append(r["reward"])
+        reward_dict = reward_function(response, data["numbers"], data["target"])
+        rewards.append(reward_dict)
+        avg_rewards.append(reward_dict["reward"])
+
     return {
         "rewards": rewards,
         "avg_reward": float(np.mean(avg_rewards)) if avg_rewards else 0.0,
@@ -221,9 +240,7 @@ def main(args):
     os.makedirs(model_saves_dir, exist_ok=True)
 
     # Load the pretrained causal language model
-    base_model = AutoModelForCausalLM.from_pretrained(
-        args.model_name, torch_dtype=torch.float16
-    ).to("cpu")
+    base_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float16).to("cpu")
 
     # Load the tokenizer associated with a pretrained causal model
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
@@ -249,8 +266,8 @@ def main(args):
 
     # Load data
     with open(TRAINING_DATA_PATH, "r") as f:
-        task_datas = json.load(f)
-    task_datas = task_datas[:NUMBER_OF_TRAINING_DATA]
+        task_data = json.load(f)
+    task_data = task_data[:NUMBER_OF_TRAINING_DATA]
 
     # Launch engines
     engines, placement_groups = launch_engines(args.num_engines, base_model_path)
@@ -319,12 +336,12 @@ def main(args):
     # - Explore: per-seed add noise -> eval -> subtract noise (GPU-only)
     # - Compute ES update on engine 0 only
     # - Broadcast weights from engine 0 to all engines (NCCL)
-    for i in range(args.num_iterations):
-        print(f"\n\n=== Generation {i} ===")
+    for iter in range(args.num_iterations):
+        print(f"\n\n=== Generation {iter} ===")
         total_iter_start = time.time()
 
         # Random seeds for population
-        seeds = [random.randint(0, 1_000_000) for _ in range(args.population_size)]
+        seeds = [random.randint(SEED_LOWER_BOUND, SEED_UPPER_BOUND) for _ in range(args.population_size)]
         seeds_perf = {}
 
         # Round-robin scheduling
@@ -338,45 +355,53 @@ def main(args):
                 seed = next(seed_iter)
             except StopIteration:
                 break
+
             # Add exploration noise
-            ray.get(
-                llm.collective_rpc.remote(
-                    "perturb_self_weights", args=(seed, args.sigma, False)
-                )
-            )
-            handle, start_ts = evaluate_countdown_handle(llm, task_datas)
-            inflight[handle] = {
+            ray.get(llm.collective_rpc.remote("perturb_self_weights", args=(seed, args.sigma, False)))
+
+            finished_task_handle, start_ts = evaluate_countdown_handle(llm, task_data)
+
+            # inflight is a dictionary used to keep track of currently running jobs or requests
+            # Keys are unique request identifiers (handle), often returned when a new job starts
+            # Values hold metadata about that job.
+            inflight[finished_task_handle] = {
                 "engine": llm,
                 "engine_idx": eng_idx,
                 "seed": seed,
                 "start_ts": start_ts,
             }
 
+        # Create a loop that continues running as long as the inflight dictionary is not empty,
+        # meaning there are still active or ongoing tasks being tracked
         while inflight:
-            done, _ = ray.wait(list(inflight.keys()), num_returns=1)
-            h = done[0]
-            meta = inflight.pop(h)
+            # Block until num_returns (set to 1) of the given Ray object references are ready (i.e., the task is finished)
+            finished_task, _ = ray.wait(list(inflight.keys()), num_returns=1)
+            # Extract the handle (the completed Ray object reference) of the finished task
+            finished_task_handle = finished_task[0]
+            # Remove the completed task from the inflight tracking dictionary
+            metadata = inflight.pop(finished_task_handle)
 
-            outputs = ray.get(h)
-            metrics = _postprocess_outputs(outputs, task_datas)
-            elapsed = time.time() - meta["start_ts"]
+            # finished_task_handle is a Ray object reference (from an async task or actor call).
+            # get(handle) retrieves the actual result of that remote computation — blocking until it’s finished
+            outputs = ray.get(finished_task_handle)
 
-            seeds_perf[meta["seed"]] = metrics
+            metrics = _postprocess_outputs(outputs, task_data)
+
+            elapsed_time = time.time() - metadata["start_ts"]
+
+            seeds_perf[metadata["seed"]] = metrics
+
             results_this_gen.append(
                 {
-                    "seed": meta["seed"],
+                    "seed": metadata["seed"],
                     "avg_reward": metrics["avg_reward"],
-                    "time": elapsed,
+                    "time": elapsed_time,
                 }
             )
 
-            llm = meta["engine"]
+            llm = metadata["engine"]
             # Remove exploration noise
-            ray.get(
-                llm.collective_rpc.remote(
-                    "restore_self_weights", args=(meta["seed"], args.sigma)
-                )
-            )
+            ray.get(llm.collective_rpc.remote("restore_self_weights", args=(metadata["seed"], args.sigma)))
 
             # Schedule next seed on this engine
             try:
@@ -384,101 +409,88 @@ def main(args):
             except StopIteration:
                 continue
 
-            ray.get(
-                llm.collective_rpc.remote(
-                    "perturb_self_weights", args=(next_seed, args.sigma, False)
-                )
-            )
-            handle, start_ts = evaluate_countdown_handle(llm, task_datas)
-            inflight[handle] = {
+            ray.get(llm.collective_rpc.remote("perturb_self_weights", args=(next_seed, args.sigma, False)))
+            finished_task_handle, start_ts = evaluate_countdown_handle(llm, task_data)
+
+            inflight[finished_task_handle] = {
                 "engine": llm,
-                "engine_idx": meta["engine_idx"],
+                "engine_idx": metadata["engine_idx"],
                 "seed": next_seed,
                 "start_ts": start_ts,
             }
             if args.verbose:
-                print(f"Scheduled seed {next_seed} on engine {meta['engine_idx']}")
+                print(f"Scheduled seed {next_seed} on engine {metadata['engine_idx']}")
 
         # Normalize rewards
-        all_avg_rewards = [v["avg_reward"] for v in seeds_perf.values()]
+        all_avg_rewards = [metric["avg_reward"] for metric in seeds_perf.values()]
         mean_reward = float(np.mean(all_avg_rewards)) if all_avg_rewards else 0.0
         std_reward = float(np.std(all_avg_rewards)) if all_avg_rewards else 0.0
         min_reward = float(np.min(all_avg_rewards)) if all_avg_rewards else 0.0
         max_reward = float(np.max(all_avg_rewards)) if all_avg_rewards else 0.0
 
-        print(
-            f"Mean reward: {mean_reward}, std: {std_reward}, min: {min_reward}, max: {max_reward}"
-        )
-        for k in seeds_perf:
-            seeds_perf[k]["norm_reward"] = (
-                seeds_perf[k]["avg_reward"] - mean_reward
-            ) / (std_reward + 1e-8)
-            if args.verbose:
-                print(f"Seed {k} normalized reward: {seeds_perf[k]['norm_reward']}")
+        print(f"Mean reward: {mean_reward}, std: {std_reward}, min: {min_reward}, max: {max_reward}")
 
-        writer.add_scalar("reward/mean", mean_reward, i)
-        writer.add_scalar("reward/std", std_reward, i)
-        writer.add_scalar("reward/min", min_reward, i)
-        writer.add_scalar("reward/max", max_reward, i)
+        # Standardize rewards by subtracting mean and dividing by standard deviation
+        for a_seed in seeds_perf:
+            seeds_perf[a_seed]["norm_reward"] = (seeds_perf[a_seed]["avg_reward"] - mean_reward) / (std_reward + 1e-8)
+
+            if args.verbose:
+                print(f"Seed {a_seed} normalized reward: {seeds_perf[a_seed]['norm_reward']}")
+
+        writer.add_scalar("reward/mean", mean_reward, iter)
+        writer.add_scalar("reward/std", std_reward, iter)
+        writer.add_scalar("reward/min", min_reward, iter)
+        writer.add_scalar("reward/max", max_reward, iter)
 
         # Compute ES update ONLY on engine 0 (baseline is already current weights)
         per_seed_coeffs = [
             (
                 seed,
-                (args.alpha / args.population_size)
-                * float(seeds_perf[seed]["norm_reward"]),
+                (args.alpha / args.population_size) * float(seeds_perf[seed]["norm_reward"]),
             )
             for seed in seeds
         ]
 
         perturb_start = time.time()
+
         handles = []
         for seed, coeff in per_seed_coeffs:
             # Use sigma_or_scale=1.0 so the applied scale is `coeff`
-            handles.append(
-                engines[0].collective_rpc.remote(
-                    "perturb_self_weights", args=(seed, coeff, False)
-                )
-            )
+            handles.append(engines[0].collective_rpc.remote("perturb_self_weights", args=(seed, coeff, False)))
+
         ray.get(handles)
+
         if args.verbose:
             print(f"Applied perturbations in {time.time() - perturb_start}s")
-        writer.add_scalar(
-            "time/perturbation_application", time.time() - perturb_start, i
-        )
+        writer.add_scalar("time/perturbation_application", time.time() - perturb_start, iter)
 
         # Broadcast updated weights from engine 0 to all engines (avoid CPU copies)
         broadcast_start = time.time()
-        ray.get(
-            [
-                e.collective_rpc.remote("broadcast_all_weights", args=(0,))
-                for e in engines
-            ]
-        )
+
+        ray.get([engine.collective_rpc.remote("broadcast_all_weights", args=(0,)) for engine in engines])
+
         if args.verbose:
             print(f"Broadcasted updated weights in {time.time() - broadcast_start}s")
-        writer.add_scalar("time/broadcast", time.time() - broadcast_start, i)
+        writer.add_scalar("time/broadcast", time.time() - broadcast_start, iter)
 
         # Logging per-result and timing
         if args.verbose:
-            for res_idx, res in enumerate(results_this_gen):
+            for result_idx, result in enumerate(results_this_gen):
                 print(
-                    f"IDX:{res_idx} Seed {res['seed']} avg_reward: {res['avg_reward']}, time: {res['time']}s"
+                    f"IDX:{result_idx} Seed {result['seed']} avg_reward: {result['avg_reward']}, time: {result['time']}s"
                 )
+
         total_iter_end = time.time()
-        writer.add_scalar("time/iteration", total_iter_end - total_iter_start, i)
-        print(
-            f"wall clock time for iteration {i}: {total_iter_end - total_iter_start}s"
-        )
-        print(f"=== Generation {i} finished ===\n")
+        writer.add_scalar("time/iteration", total_iter_end - total_iter_start, iter)
+        print(f"wall clock time for iteration {iter}: {total_iter_end - total_iter_start}s")
+        print(f"=== Generation {iter} finished ===\n")
 
     # Save final model weights (all engines are in sync; save from engine 0)
     final_model_path = f"{model_saves_dir}/final_model_iteration_{args.num_iterations}"
     os.makedirs(final_model_path, exist_ok=True)
+
     ray.get(
-        engines[0].collective_rpc.remote(
-            "save_self_weights_to_disk", args=(f"{final_model_path}/pytorch_model.pth",)
-        )
+        engines[0].collective_rpc.remote("save_self_weights_to_disk", args=(f"{final_model_path}/pytorch_model.pth",))
     )
     print(f"Final model weights saved to {final_model_path}.")
 

@@ -1,6 +1,9 @@
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
+from typing import Dict
+from typing import List
+from typing import Optional
 
 import pandas as pd
 from torch.utils.data import Dataset
@@ -35,9 +38,8 @@ def format_reward_function(response: str, end_token: Optional[str] = None) -> fl
 
     return reward
 
-def answer_reward_function(
-    response: str, numbers: List[int] = None, target: int = None
-) -> float:
+
+def answer_reward_function(response: str, numbers: List[int] = None, target: int = None) -> float:
     # modified
     """
     Checks if the last <answer>...</answer> uses all numbers exactly once and evaluates to the target.
@@ -51,7 +53,7 @@ def answer_reward_function(
 
     # Only check the last answer
     answer_content = all_matches[-1]
-    
+
     allowed_chars = r"^[0-9+\-*/() ]+$"
 
     if not answer_content:
@@ -81,12 +83,14 @@ def reward_function(
     target: int = None,
     end_token: str = None,
 ) -> Dict[str, Any]:
-    """Reward function for Countdown Tasks.
+    """
+    Reward function for Countdown Tasks.
 
     Total reward = 0.1 * format_reward + answer_reward
     """
     format_reward = format_reward_function("<think>" + response, end_token)
     answer_reward = answer_reward_function(response, numbers, target)
+
     return {
         "reward": format_reward * 0.1 + answer_reward,
         "reward_info": {
