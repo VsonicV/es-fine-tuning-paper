@@ -1,3 +1,6 @@
+"""
+Accelerated version of ES fine tuning of LLMs
+"""
 import argparse
 import gc
 import json
@@ -111,6 +114,9 @@ def parse_args() -> argparse.Namespace:
 # to exchange data. For example: synchronizing gradients, broadcasting model
 # weights, etc. NCCL handles these operations efficiently at the hardware level
 class ESNcclLLM(LLM):
+    """
+    The class that is run by Ray on a cluster
+    """
     def __init__(self, *args, **kwargs):
         # Remove the CUDA_VISIBLE_DEVICES environment variable if it’s set
         # Hand off GPU assignment control to Ray’s internal runtime
@@ -126,6 +132,18 @@ class ESNcclLLM(LLM):
 def launch_engines(
     num_engines: int, model_name: str
 ) -> Tuple[List[ray.actor.ActorHandle], List[ray.util.placement_group.PlacementGroup]]:
+    """
+    Launches ESNcclLLM class on the Ray cluster
+
+    :param numn_engines
+        Number of nodes in the cluster
+
+    : model_name:
+        Name of the model
+
+    :return:
+        Returns handles and placement gropu lists
+    """
     # Create a list of Ray placement groups (PGs), each reserving 1 GPU (and 0 CPUs)
     pgs = [
         # In Ray, a PG is a way to pre-reserve cluster resources. Think of it as a resource container
@@ -188,6 +206,17 @@ def launch_engines(
 
 
 def evaluate_countdown_handle(llm, task_data):
+    """
+    Evaluate the LLM on the training dataset
+
+    :param llm
+        The LLM to evaluate
+    :param task_data
+        The training data for a specific task
+
+    :return:
+        The handle to the generated response and the current time
+    """
     prompts = [data["context"] for data in task_data]
 
     sampling_params = SamplingParams(
@@ -215,7 +244,10 @@ def _postprocess_outputs(outputs, task_data):
     }
 
 
-def main(args):
+def main(args):  # pylint: disable=too-many-branches, too-many-statements, too-many-locals
+    """
+    Main method for accelerated version of ES fine tuning of LLMs
+    """
     # Ensure local Ray
     os.environ.pop("RAY_ADDRESS", None)  # The IP address of the Ray cluster to connect to
     os.environ.pop("RAY_HEAD_IP", None)  # The IP address of the Ray head node in a cluster
@@ -265,7 +297,7 @@ def main(args):
         torch.cuda.empty_cache()
 
     # Load data
-    with open(TRAINING_DATA_PATH, "r") as f:
+    with open(TRAINING_DATA_PATH, "r", encoding='utf-8') as f:
         task_data = json.load(f)
     task_data = task_data[:NUMBER_OF_TRAINING_DATA]
 
@@ -307,19 +339,19 @@ def main(args):
                 # Forcibly terminate the remote actor
                 # Free GPU/CPU resources used by each engine
                 ray.kill(engine)
-            except Exception:
-                pass
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                print(f"ray.kill() for engine {engine} resulted in exception {type(e).__name__}: {e}")
         for pg in placement_groups:
             try:
                 # Release the placement_group resource reservations
                 remove_placement_group(pg)
-            except Exception:
-                pass
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                print(f"remove_placement_group for placement group {pg} resulted in exception {type(e).__name__}: {e}")
 
         # End the Ray session cleanly
         ray.shutdown()
 
-    def sig_handler(sig, frame):
+    def sig_handler():
         cleanup()
         sys.exit(0)
 
@@ -336,8 +368,8 @@ def main(args):
     # - Explore: per-seed add noise -> eval -> subtract noise (GPU-only)
     # - Compute ES update on engine 0 only
     # - Broadcast weights from engine 0 to all engines (NCCL)
-    for iter in range(args.num_iterations):
-        print(f"\n\n=== Generation {iter} ===")
+    for idx in range(args.num_iterations):
+        print(f"\n\n=== Generation {idx} ===")
         total_iter_start = time.time()
 
         # Random seeds for population
@@ -345,7 +377,7 @@ def main(args):
         seeds_perf = {}
 
         # Round-robin scheduling
-        seed_iter = iter(seeds)
+        seed_iter = idx(seeds)
         inflight = {}
         results_this_gen = []
 
@@ -374,7 +406,7 @@ def main(args):
         # Create a loop that continues running as long as the inflight dictionary is not empty,
         # meaning there are still active or ongoing tasks being tracked
         while inflight:
-            # Block until num_returns (set to 1) of the given Ray object references are ready (i.e., the task is finished)
+            # Block until num_returns (set to 1) of the given Ray object references are ready (i.e., task is finished)
             finished_task, _ = ray.wait(list(inflight.keys()), num_returns=1)
             # Extract the handle (the completed Ray object reference) of the finished task
             finished_task_handle = finished_task[0]
@@ -431,16 +463,16 @@ def main(args):
         print(f"Mean reward: {mean_reward}, std: {std_reward}, min: {min_reward}, max: {max_reward}")
 
         # Standardize rewards by subtracting mean and dividing by standard deviation
-        for a_seed in seeds_perf:
-            seeds_perf[a_seed]["norm_reward"] = (seeds_perf[a_seed]["avg_reward"] - mean_reward) / (std_reward + 1e-8)
+        for a_seed, a_metric in seeds_perf.items():
+            a_metric["norm_reward"] = (a_metric["avg_reward"] - mean_reward) / (std_reward + 1e-8)
 
             if args.verbose:
                 print(f"Seed {a_seed} normalized reward: {seeds_perf[a_seed]['norm_reward']}")
 
-        writer.add_scalar("reward/mean", mean_reward, iter)
-        writer.add_scalar("reward/std", std_reward, iter)
-        writer.add_scalar("reward/min", min_reward, iter)
-        writer.add_scalar("reward/max", max_reward, iter)
+        writer.add_scalar("reward/mean", mean_reward, idx)
+        writer.add_scalar("reward/std", std_reward, idx)
+        writer.add_scalar("reward/min", min_reward, idx)
+        writer.add_scalar("reward/max", max_reward, idx)
 
         # Compute ES update ONLY on engine 0 (baseline is already current weights)
         per_seed_coeffs = [
@@ -462,7 +494,7 @@ def main(args):
 
         if args.verbose:
             print(f"Applied perturbations in {time.time() - perturb_start}s")
-        writer.add_scalar("time/perturbation_application", time.time() - perturb_start, iter)
+        writer.add_scalar("time/perturbation_application", time.time() - perturb_start, idx)
 
         # Broadcast updated weights from engine 0 to all engines (avoid CPU copies)
         broadcast_start = time.time()
@@ -471,19 +503,20 @@ def main(args):
 
         if args.verbose:
             print(f"Broadcasted updated weights in {time.time() - broadcast_start}s")
-        writer.add_scalar("time/broadcast", time.time() - broadcast_start, iter)
+        writer.add_scalar("time/broadcast", time.time() - broadcast_start, idx)
 
         # Logging per-result and timing
         if args.verbose:
             for result_idx, result in enumerate(results_this_gen):
                 print(
-                    f"IDX:{result_idx} Seed {result['seed']} avg_reward: {result['avg_reward']}, time: {result['time']}s"
+                    f"IDX:{result_idx} Seed {result['seed']} avg_reward: {result['avg_reward']}, "
+                    f"time: {result['time']}s"
                 )
 
         total_iter_end = time.time()
-        writer.add_scalar("time/iteration", total_iter_end - total_iter_start, iter)
-        print(f"wall clock time for iteration {iter}: {total_iter_end - total_iter_start}s")
-        print(f"=== Generation {iter} finished ===\n")
+        writer.add_scalar("time/iteration", total_iter_end - total_iter_start, idx)
+        print(f"wall clock time for iteration {idx}: {total_iter_end - total_iter_start}s")
+        print(f"=== Generation {idx} finished ===\n")
 
     # Save final model weights (all engines are in sync; save from engine 0)
     final_model_path = f"{model_saves_dir}/final_model_iteration_{args.num_iterations}"
@@ -498,5 +531,5 @@ def main(args):
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    main(args)
+    cli_args = parse_args()
+    main(cli_args)

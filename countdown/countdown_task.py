@@ -1,12 +1,11 @@
+"""
+Utility functions for countdown task
+"""
 import re
-from pathlib import Path
 from typing import Any
 from typing import Dict
 from typing import List
 from typing import Optional
-
-import pandas as pd
-from torch.utils.data import Dataset
 
 
 def format_reward_function(response: str, end_token: Optional[str] = None) -> float:
@@ -56,9 +55,7 @@ def answer_reward_function(response: str, numbers: List[int] = None, target: int
 
     allowed_chars = r"^[0-9+\-*/() ]+$"
 
-    if not answer_content:
-        return 0.0
-    if not re.match(allowed_chars, answer_content):
+    if not answer_content or not re.match(allowed_chars, answer_content):
         return 0.0
 
     # Check numbers used
@@ -66,12 +63,16 @@ def answer_reward_function(response: str, numbers: List[int] = None, target: int
     if sorted(used_numbers) != sorted(numbers):
         return 0.0
 
-    # Try evaluating
+    # Try evaluatingi the answer
+    # Setting __builtins__ to None disables access to all built-in functions and objects, such
+    # as: open, exec, import, print, len, etc. This is a safety measure — to prevent code
+    # injection or unauthorized access.
     try:
-        result = eval(answer_content, {"__builtins__": None}, {})
+        result = eval(answer_content, {"__builtins__": None}, {})  # pylint: disable=eval-used
         if abs(float(result) - float(target)) < 1e-5:
             return 1.0
-    except:
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        print(f"Evaluating {answer_content} resulted in exception {type(e).__name__}: {e}")
         return 0.0
 
     return 0.0
