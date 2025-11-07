@@ -1,66 +1,102 @@
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.utils import logging
-import numpy as np
-import copy
-import os
+"""
+ES fine tuning of LLMs
+"""
+
 import argparse
-from accelerate import Accelerator
-import time
-import torch.multiprocessing as mp
-import threading
-from queue import Queue
-from concurrent.futures import ThreadPoolExecutor
-import math
 import gc
 import json
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
+import torch
+import torch.multiprocessing as mp
+from accelerate import Accelerator
+
+# Import countdown reward function
+from countdown_task import reward_function
+from transformers import AutoModelForCausalLM
+from transformers import AutoTokenizer
+from transformers.utils import logging
 
 logging.set_verbosity_error()
 torch.backends.cuda.matmul.allow_tf32 = True
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--model_name', type=str, default='Qwen/Qwen2.5-3B-Instruct')
-parser.add_argument('--hf_cache_dir', type=str, default='hf_cache')
-parser.add_argument('--precision', type=str, default='bf16')
-parser.add_argument('--gpu_threads', type=int, default=4, help='Number of parallel threads per GPU')
-parser.add_argument('--verbose', action='store_true', help='Print verbose logs')
-parser.add_argument('--data_sample', type=int, default=1000, help='Number of data samples to use for training')
+parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-3B-Instruct")
+parser.add_argument("--hf_cache_dir", type=str, default="hf_cache")
+parser.add_argument("--precision", type=str, default="bf16")
+parser.add_argument("--gpu_threads", type=int, default=4, help="Number of parallel threads per GPU")
+parser.add_argument("--verbose", action="store_true", help="Print verbose logs")
+parser.add_argument("--data_sample", type=int, default=1000, help="Number of data samples to use for training")
 args = parser.parse_args()
 
 
 # Hyperparameters for ES
-NUM_ITERATIONS = 1000             # Number of ES iterations (generations)
-POPULATION_SIZE = 30              # Population size (number of perturbations per iteration)
-SIGMA = 0.001                     # Standard deviation for weight perturbations (noise scale)
-ALPHA = 0.0005                    # Learning rate
-max_new_tokens = 1024              # Maximum number of tokens allowed to be generated
-do_sample = False                 # Whether sampling is allowed in generating tokens, default to be not allowed (greedy decoding for ES)
-initial_seed = 33                 # Initial random seed
+NUM_ITERATIONS = 1000  # Number of ES iterations (generations)
+POPULATION_SIZE = 30  # Population size (number of perturbations per iteration)
+SIGMA = 0.001  # Standard deviation for weight perturbations (noise scale)
+ALPHA = 0.0005  # Learning rate
+MAX_NEW_TOKENS = 1024  # Maximum number of tokens allowed to be generated
+DO_SAMPLE = (
+    False  # Whether sampling is allowed in generating tokens, default to be not allowed (greedy decoding for ES)
+)
+INITIAL_SEED = 33  # Initial random seed
 
 
-# Import countdown reward function
-from countdown_task import reward_function
 print("Using countdown reward function")
 
 # Dataset will be loaded in main function
 
+
 def force_memory_cleanup():
+    """
+    Manually clear memory on both CPU and GPU
+    """
+
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
         torch.cuda.synchronize()
 
-def save_model_checkpoint(model, tokenizer, iteration, model_name, initial_seed, args, dataset_size):
-    """Save model checkpoint at specified iteration"""
+
+def save_model_checkpoint(  # pylint: disable=too-many-arguments,disable=too-many-positional-arguments
+        model,
+        tokenizer,
+        iteration,
+        model_name,
+        initial_seed,
+        cli_args,
+        dataset_size
+):
+
+    """
+    Save model checkpoint at specified iteration
+    """
     question_num = dataset_size
-    save_dir = f"{model_name}_es_random_seed{initial_seed}_pop{POPULATION_SIZE}_iter{iteration}_sigma{SIGMA}_alpha{ALPHA}_{args.precision}_threads{args.gpu_threads}_question_num{question_num}_checkpoint"
+    save_dir = (
+        f"{model_name}_es_random_seed{initial_seed}_pop{POPULATION_SIZE}_iter{iteration}_sigma{SIGMA}"
+        f"_alpha{ALPHA}_{cli_args.precision}_threads{cli_args.gpu_threads}_question_num{question_num}_checkpoint"
+    )
     print(f"Saving checkpoint at iteration {iteration} to {save_dir}...")
     model.save_pretrained(save_dir)
     tokenizer.save_pretrained(save_dir)
-    print(f"Checkpoint saved successfully.")
+    print("Checkpoint saved successfully.")
 
-def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_idx=None, thread_id=None, verbose=False, return_text=False):
+
+def evaluate_model(  # pylint: disable=too-many-arguments,disable=too-many-positional-arguments,disable=too-many-locals
+    model,
+    tokenizer,
+    input_text,
+    target_text,
+    accelerator,
+    seed_idx=None,
+    thread_id=None,
+    verbose=False,
+    return_text=False,
+):
     """
     Generate a response from the model given an input (single or batch) and compute rewards.
     """
@@ -77,7 +113,9 @@ def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_
     input_ids = tokenized_inputs["input_ids"].to(accelerator.device)
     attention_mask = tokenized_inputs["attention_mask"].to(accelerator.device)
     with torch.inference_mode():
-        outputs = model.generate(input_ids, attention_mask=attention_mask, max_new_tokens=max_new_tokens, do_sample=do_sample)
+        outputs = model.generate(
+            input_ids, attention_mask=attention_mask, max_new_tokens=MAX_NEW_TOKENS, do_sample=DO_SAMPLE
+        )
         if torch.cuda.is_available():
             torch.cuda.synchronize(accelerator.device)
 
@@ -104,7 +142,7 @@ def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_
             start_idx = inp_text.find("[")
             end_idx = inp_text.find("]")
             if start_idx != -1 and end_idx != -1:
-                numbers_str = inp_text[start_idx+1:end_idx]
+                numbers_str = inp_text[start_idx + 1 : end_idx]
                 numbers = [int(n) for n in numbers_str.split() if n.isdigit()]
 
         if tgt_text.isdigit():
@@ -119,13 +157,12 @@ def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_
         reward = reward_result["reward"]
         rewards.append(reward)
 
-
     if return_text:
         return rewards, generated_texts
-    else:
-        return rewards
+    return rewards
 
-def process_seed(seed_args):
+
+def process_seed(seed_args):  # pylint: disable=too-many-locals
     """Function to process a single seed, used for thread pool"""
     seed_idx, seed, model, tokenizer, accelerator, thread_id, verbose, dataset = seed_args
 
@@ -133,17 +170,12 @@ def process_seed(seed_args):
         print(f"Process {accelerator.process_index} Thread {thread_id} processing seed {seed_idx} (value: {seed})")
 
     # Weight Perturbation
-    for name, param in model.named_parameters():
+    for _, param in model.named_parameters():
         gen = torch.Generator(device=param.device)
 
         gen.manual_seed(int(seed))
 
-        noise = torch.randn(
-            param.shape,
-            generator=gen,
-            device=param.device,
-            dtype=param.dtype
-        )
+        noise = torch.randn(param.shape, generator=gen, device=param.device, dtype=param.dtype)
         param.data.add_(SIGMA * noise)
 
     # Ensure weights are fully loaded before evaluation
@@ -153,22 +185,26 @@ def process_seed(seed_args):
     # Evaluate all prompts with perturbed weights in batch
     input_texts = [input_text for input_text, _ in dataset]
     target_texts = [target_text for _, target_text in dataset]
-    rewards = evaluate_model(model, tokenizer, input_texts, target_texts, accelerator,
-                           seed_idx=seed_idx, thread_id=thread_id, verbose=verbose, return_text=False)
+    rewards = evaluate_model(
+        model,
+        tokenizer,
+        input_texts,
+        target_texts,
+        accelerator,
+        seed_idx=seed_idx,
+        thread_id=thread_id,
+        verbose=verbose,
+        return_text=False,
+    )
     total_reward = sum(rewards)
 
     # Restore original weights (direct inplace modification)
-    for name, param in model.named_parameters():
+    for _, param in model.named_parameters():
         gen = torch.Generator(device=param.device)
 
         gen.manual_seed(int(seed))
 
-        noise = torch.randn(
-            param.shape,
-            generator=gen,
-            device=param.device,
-            dtype=param.dtype
-        )
+        noise = torch.randn(param.shape, generator=gen, device=param.device, dtype=param.dtype)
         param.data.add_(-SIGMA * noise)
 
     if torch.cuda.is_available():
@@ -176,35 +212,42 @@ def process_seed(seed_args):
 
     average_reward = total_reward / len(dataset)
 
-
     force_memory_cleanup()
 
     if verbose:
-        print(f"Process {accelerator.process_index} Thread {thread_id} completed seed {seed_idx} with reward {average_reward:.4f}")
+        print(
+            (
+                f"Process {accelerator.process_index} Thread {thread_id} completed seed "
+                f" {seed_idx} with reward {average_reward:.4f}"
+            )
+        )
 
     return seed_idx, average_reward
 
 
 # --- Main Evolution Strategies Loop ---
-def main():
+def main():  # pylint: disable=too-many-branches, too-many-statements, too-many-locals
+    """
+    Main method for accelerated version of ES fine tuning of LLMs
+    """
     accelerator = Accelerator()
 
     # --- Load Dataset from JSON File ---
-    data_path = os.path.join(os.path.dirname(__file__), 'data/countdown.json')
+    data_path = os.path.join(os.path.dirname(__file__), "data/countdown.json")
     if not os.path.exists(data_path):
         raise FileNotFoundError(f"Dataset file not found: {data_path}")
-    
-    with open(data_path, 'r') as f:
+
+    with open(data_path, "r", encoding="utf-8") as f:
         data_json = json.load(f)
 
     dataset = []
     for item in data_json:
-        context = item['context']
-        target = item['target']
+        context = item["context"]
+        target = item["target"]
         dataset.append((context, target))
 
     # Use a subset of the dataset for training
-    dataset = dataset[:args.data_sample]
+    dataset = dataset[: args.data_sample]
     if accelerator.is_main_process:
         print(f"Loaded {len(dataset)} countdown samples from {data_path}")
 
@@ -220,16 +263,21 @@ def main():
     if accelerator.is_main_process:
         print(f"Loading model {model_name}...")
 
-
     # Load model on main process first then sync
     model_list = []
-    for model_index in range(args.gpu_threads):
-        model_list.append(AutoModelForCausalLM.from_pretrained(
-            model_name,
-            cache_dir=hf_cache_dir,
-            device_map={"": accelerator.process_index},  # Assign devices explicitly
-            torch_dtype=torch.float16 if args.precision == 'fp16' else (torch.bfloat16 if args.precision == 'bf16' else torch.float32),
-        ))
+    for _ in range(args.gpu_threads):
+        model_list.append(
+            AutoModelForCausalLM.from_pretrained(
+                model_name,
+                cache_dir=hf_cache_dir,
+                device_map={"": accelerator.process_index},  # Assign devices explicitly
+                torch_dtype=(
+                    torch.float16
+                    if args.precision == "fp16"
+                    else (torch.bfloat16 if args.precision == "bf16" else torch.float32)
+                ),
+            )
+        )
         # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False, cache_dir=hf_cache_dir)
 
@@ -245,7 +293,7 @@ def main():
     # Record total training start time
     training_start_time = time.time()
 
-    np.random.seed(initial_seed)
+    np.random.seed(INITIAL_SEED)
 
     for iteration in range(NUM_ITERATIONS):
         # Record iteration start time
@@ -269,7 +317,7 @@ def main():
             seeds_tensor = torch.zeros(POPULATION_SIZE, dtype=torch.long, device=accelerator.device)
 
         # Broadcast seeds from main process to all processes
-        if accelerator.num_processes>1:
+        if accelerator.num_processes > 1:
             torch.distributed.broadcast(seeds_tensor, src=0)
         seeds = seeds_tensor.cpu().tolist()  # Convert back to list for all processes
 
@@ -284,7 +332,12 @@ def main():
                 local_seeds.append((seed_idx, seed))
 
         if args.verbose:
-            print(f"Process {accelerator.process_index} assigned {len(local_seeds)} seeds: {[idx for idx, _ in local_seeds]}")
+            print(
+                (
+                    f"Process {accelerator.process_index} assigned {len(local_seeds)}"
+                    f" seeds: {[idx for idx, _ in local_seeds]}"
+                )
+            )
 
         # Process seeds in smaller batches to reduce memory pressure
         local_rewards = []
@@ -299,7 +352,18 @@ def main():
                 thread_args = []
                 for thread_id, (seed_idx, seed) in enumerate(batch_seeds):
                     # Pass verbose flag as argument to process_seed function
-                    thread_args.append((seed_idx, seed, model_list[thread_id], tokenizer, accelerator, thread_id, args.verbose, dataset))
+                    thread_args.append(
+                        (
+                            seed_idx,
+                            seed,
+                            model_list[thread_id],
+                            tokenizer,
+                            accelerator,
+                            thread_id,
+                            args.verbose,
+                            dataset,
+                        )
+                    )
 
                 # Execute in parallel and collect results
                 results = list(executor.map(process_seed, thread_args))
@@ -316,7 +380,7 @@ def main():
             all_rewards[seed_idx] = reward
 
         # Aggregate rewards from all processes (each process will get the full reward list)
-        if accelerator.num_processes>1:
+        if accelerator.num_processes > 1:
             torch.distributed.all_reduce(all_rewards, op=torch.distributed.ReduceOp.SUM)
 
         # Convert aggregated rewards back to Python list
@@ -329,7 +393,6 @@ def main():
         rewards_tensor = np.array(rewards, dtype=np.float32)
         rewards_normalized = (rewards_tensor - rewards_tensor.mean()) / (rewards_tensor.std() + 1e-8)
 
-
         if args.verbose:
             print(f"Process {accelerator.process_index} updating model weights")
         original_model = model_list[0]
@@ -341,12 +404,7 @@ def main():
                 seed = seeds[seed_idx]
                 gen.manual_seed(int(seed))
 
-                noise = torch.randn(
-                    param.shape,
-                    generator=gen,
-                    device=param.device,
-                    dtype=param.dtype
-                )
+                noise = torch.randn(param.shape, generator=gen, device=param.device, dtype=param.dtype)
                 noise.mul_(float(r_norm))
                 update.add_(noise)
                 del noise
@@ -375,27 +433,42 @@ def main():
         force_memory_cleanup()
 
         if accelerator.is_main_process:
-            print(f"Iteration {iteration + 1}/{NUM_ITERATIONS}, Time: {iter_time:.2f}s, Mean: {mean_reward:.2f}, Min: {min_reward:.2f}, Max: {max_reward:.2f}")
-            print(f"GPU Memory: {torch.cuda.memory_allocated() / 1024**2:.2f}MB allocated, {torch.cuda.max_memory_allocated() / 1024**2:.2f}MB peak")
+            print(
+                (
+                    f"Iteration {iteration + 1}/{NUM_ITERATIONS}, Time: {iter_time:.2f}s, Mean: {mean_reward:.2f}"
+                    f", Min: {min_reward:.2f}, Max: {max_reward:.2f}"
+                )
+            )
+            print(
+                (
+                    f"GPU Memory: {torch.cuda.memory_allocated() / 1024**2:.2f}MB allocated"
+                    f", {torch.cuda.max_memory_allocated() / 1024**2:.2f}MB peak"
+                )
+            )
 
             # Save checkpoint every 100 iterations
             if (iteration + 1) % 100 == 0:
-                save_model_checkpoint(original_model, tokenizer, iteration + 1, model_name, initial_seed, args, len(dataset))
+                save_model_checkpoint(
+                    original_model, tokenizer, iteration + 1, model_name, INITIAL_SEED, args, len(dataset)
+                )
 
     total_time = time.time() - training_start_time
-
 
     # Save the final fine-tuned model weights.
     if accelerator.is_main_process:
         print(f"Training completed in {total_time:.2f}s ({total_time/60:.2f} minutes)")
         question_num = len(dataset)
-        save_dir = f"{model_name}_es_random_seed{initial_seed}_pop{POPULATION_SIZE}_iter{NUM_ITERATIONS}_sigma{SIGMA}_alpha{ALPHA}_{args.precision}_threads{args.gpu_threads}_question_num{question_num}_final"
+        save_dir = (
+            f"{model_name}_es_random_seed{INITIAL_SEED}_pop{POPULATION_SIZE}_iter{NUM_ITERATIONS}"
+            f"_sigma{SIGMA}_alpha{ALPHA}_{args.precision}_threads{args.gpu_threads}_question_num{question_num}_final"
+        )
         print(f"Saving final model to {save_dir}...")
         original_model.save_pretrained(save_dir)
         tokenizer.save_pretrained(save_dir)
-        print(f"Final model saved successfully.")
+        print("Final model saved successfully.")
+
 
 if __name__ == "__main__":
     os.environ["PYTHONWARNINGS"] = "ignore"
-    mp.set_start_method('spawn', force=True)
+    mp.set_start_method("spawn", force=True)
     main()
