@@ -39,7 +39,6 @@ def format_reward_function(response: str, end_token: Optional[str] = None) -> fl
 
 
 def answer_reward_function(response: str, numbers: List[int] = None, target: int = None) -> float:
-    # modified
     """
     Checks if the last <answer>...</answer> uses all numbers exactly once and evaluates to the target.
     Returns 1.0 if the last one is correct, else 0.0.
@@ -63,7 +62,8 @@ def answer_reward_function(response: str, numbers: List[int] = None, target: int
     if sorted(used_numbers) != sorted(numbers):
         return 0.0
 
-    # Try evaluatingi the answer
+    # Try evaluating the answer
+    #
     # Setting __builtins__ to None disables access to all built-in functions and objects, such
     # as: open, exec, import, print, len, etc. This is a safety measure — to prevent code
     # injection or unauthorized access.

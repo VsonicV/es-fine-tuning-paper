@@ -42,13 +42,13 @@ from vllm.utils import get_open_port
 from countdown.countdown_task import reward_function
 
 # Default Hyperparameters
-MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
-SIGMA = 0.001
-ALPHA = 0.0005
-POPULATION_SIZE = 30
+MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"  # The name of the model to fine tune
+NUM_ITERATIONS = 1000  # Number of ES iterations (generations)
+POPULATION_SIZE = 30  # Population size (number of perturbations per iteration)
+SIGMA = 0.001  # Standard deviation for weight perturbations (noise scale)
+ALPHA = 0.0005  # Learning rate
 NUM_ENGINES = 4
-NUM_ITERATIONS = 1000
-EXPERIMENT_DIR = "es-ft-experiment"
+EXPERIMENT_DIR = "es-ft-experiment"  # Directory for log files, saved models, etc.
 CUDA_DEVICES = "0,1,2,3"
 TRAINING_DATA_PATH = "countdown/data/countdown.json"
 NUMBER_OF_TRAINING_DATA = 200

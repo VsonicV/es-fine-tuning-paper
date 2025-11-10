@@ -1,0 +1,44 @@
+name: Lint
+
+on: [push, pull_request]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13.5"
+
+      - name: Set up virtual environment and install dependencies
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-build.txt
+
+      - name: Run black (code formatter)
+        run: |
+          ./venv/bin/black --check --diff .
+
+      - name: Run isort (import sorter)
+        run: |
+          ./venv/bin/isort --check-only --diff .
+
+      - name: Run flake8 (style guide enforcement)
+        run: |
+          ./venv/bin/flake8 .
+
+      - name: Run pylint (code analysis)
+        run: |
+          ./venv/bin/pylint $(git ls-files '*.py')
+
+      - name: Run pymarkdownlint (Markdown linting)
+        run: |
+          ./venv/bin/pymarkdown --config ./.pymarkdownlint.yaml scan ./docs/**/*.md ./README.mdsource venv/bin/activate
