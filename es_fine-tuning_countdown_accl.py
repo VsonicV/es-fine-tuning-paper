@@ -1,6 +1,7 @@
 """
 Accelerated version of ES fine tuning of LLMs
 """
+
 import argparse
 import gc
 import json
@@ -117,6 +118,7 @@ class ESNcclLLM(LLM):
     """
     The class that is run by Ray on a cluster
     """
+
     def __init__(self, *args, **kwargs):
         # Remove the CUDA_VISIBLE_DEVICES environment variable if it’s set
         # Hand off GPU assignment control to Ray’s internal runtime
@@ -297,7 +299,7 @@ def main(args):  # pylint: disable=too-many-branches, too-many-statements, too-m
         torch.cuda.empty_cache()
 
     # Load data
-    with open(TRAINING_DATA_PATH, "r", encoding='utf-8') as f:
+    with open(TRAINING_DATA_PATH, "r", encoding="utf-8") as f:
         task_data = json.load(f)
     task_data = task_data[:NUMBER_OF_TRAINING_DATA]
 

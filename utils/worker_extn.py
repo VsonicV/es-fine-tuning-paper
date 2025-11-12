@@ -1,6 +1,7 @@
 """
 Utility methods used by ES trainer
 """
+
 import gc
 import time
 

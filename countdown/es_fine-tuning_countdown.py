@@ -62,15 +62,8 @@ def force_memory_cleanup():
 
 
 def save_model_checkpoint(  # pylint: disable=too-many-arguments,disable=too-many-positional-arguments
-        model,
-        tokenizer,
-        iteration,
-        model_name,
-        initial_seed,
-        cli_args,
-        dataset_size
+    model, tokenizer, iteration, model_name, initial_seed, cli_args, dataset_size
 ):
-
     """
     Save model checkpoint at specified iteration
     """

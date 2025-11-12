@@ -1,6 +1,7 @@
 """
 Utility functions for countdown task
 """
+
 import re
 from typing import Any
 from typing import Dict
