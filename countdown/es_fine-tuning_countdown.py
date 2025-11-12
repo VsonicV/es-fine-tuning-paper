@@ -30,7 +30,6 @@ parser.add_argument("--precision", type=str, default="bf16")
 parser.add_argument("--gpu_threads", type=int, default=4, help="Number of parallel threads per GPU")
 parser.add_argument("--verbose", action="store_true", help="Print verbose logs")
 parser.add_argument("--data_sample", type=int, default=1000, help="Number of data samples to use for training")
-parser.add_argument("--seed_shift", action="store_true", help="Add a fixed offset to random number generator seed")
 args = parser.parse_args()
 
 
@@ -164,21 +163,16 @@ def evaluate_model(  # pylint: disable=too-many-arguments,disable=too-many-posit
 
 def process_seed(seed_args):  # pylint: disable=too-many-locals
     """Function to process a single seed, used for thread pool"""
-    seed_idx, seed, model, tokenizer, accelerator, thread_id, verbose, dataset, seed_shift = seed_args
+    seed_idx, seed, model, tokenizer, accelerator, thread_id, verbose, dataset = seed_args
 
     if verbose:
         print(f"Process {accelerator.process_index} Thread {thread_id} processing seed {seed_idx} (value: {seed})")
 
     # Weight Perturbation
-    seed_shift_value = 0
     for _, param in model.named_parameters():
         gen = torch.Generator(device=param.device)
 
-        if seed_shift:
-            gen.manual_seed(int(seed + seed_shift_value))
-        else:
-            gen.manual_seed(int(seed))
-        seed_shift_value += 1
+        gen.manual_seed(int(seed))
 
         noise = torch.randn(param.shape, generator=gen, device=param.device, dtype=param.dtype)
         param.data.add_(SIGMA * noise)
@@ -204,15 +198,10 @@ def process_seed(seed_args):  # pylint: disable=too-many-locals
     total_reward = sum(rewards)
 
     # Restore original weights (direct inplace modification)
-    seed_shift_value = 0
     for _, param in model.named_parameters():
         gen = torch.Generator(device=param.device)
 
-        if seed_shift:
-            gen.manual_seed(int(seed + seed_shift_value))
-        else:
-            gen.manual_seed(int(seed))
-        seed_shift_value += 1
+        gen.manual_seed(int(seed))
 
         noise = torch.randn(param.shape, generator=gen, device=param.device, dtype=param.dtype)
         param.data.add_(-SIGMA * noise)
@@ -372,7 +361,6 @@ def main():  # pylint: disable=too-many-branches, too-many-statements, too-many-
                             thread_id,
                             args.verbose,
                             dataset,
-                            args.seed_shift,
                         )
                     )
 
@@ -408,17 +396,13 @@ def main():  # pylint: disable=too-many-branches, too-many-statements, too-many-
             print(f"Process {accelerator.process_index} updating model weights")
 
         original_model = model_list[0]
-        seed_shift_value = 0
         for name, param in original_model.named_parameters():
             gen = torch.Generator(device=param.device)
             update = torch.zeros_like(param)
             for seed_idx in range(POPULATION_SIZE):
                 r_norm = rewards_normalized[seed_idx]
                 seed = seeds[seed_idx]
-                if args.seed_shift:
-                    gen.manual_seed(int(seed + seed_shift_value))
-                else:
-                    gen.manual_seed(int(seed))
+                gen.manual_seed(int(seed))
 
                 noise = torch.randn(param.shape, generator=gen, device=param.device, dtype=param.dtype)
                 noise.mul_(float(r_norm))
@@ -427,7 +411,6 @@ def main():  # pylint: disable=too-many-branches, too-many-statements, too-many-
             update.div_(POPULATION_SIZE)
             param.data.add_(ALPHA * update)
             torch.cuda.empty_cache()
-            seed_shift_value += 1
 
         for model_idx in range(1, len(model_list)):
             original_model_tmp = model_list[model_idx]
