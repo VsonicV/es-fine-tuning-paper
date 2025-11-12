@@ -35,7 +35,7 @@ args = parser.parse_args()
 
 
 # Hyperparameters for ES
-NUM_ITERATIONS = 1000  # Number of ES iterations (generations)
+NUM_ITERATIONS = 500  # Number of ES iterations (generations)
 POPULATION_SIZE = 30  # Population size (number of perturbations per iteration)
 SIGMA = 0.001  # Standard deviation for weight perturbations (noise scale)
 ALPHA = 0.0005  # Learning rate
@@ -44,7 +44,6 @@ DO_SAMPLE = (
     False  # Whether sampling is allowed in generating tokens, default to be not allowed (greedy decoding for ES)
 )
 INITIAL_SEED = 33  # Initial random seed
-
 
 print("Using countdown reward function")
 
