@@ -3,8 +3,8 @@ model:
   device: "cuda"
   dtype: "bfloat16"
 data:
-  train_path: "data/countdown_samples.json"
-  test_path: "data/countdown_samples.json"
+  train_path: "./data/countdown_samples.json"
+  test_path: "./data/countdown_samples.json"
   test_size: 128
   train_start_idx: 0
   train_end_idx: 200

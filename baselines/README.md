@@ -81,3 +81,54 @@ We make sure the total number of sample evaluations is the same as in the ES exp
 ```bash
 python train_countdown.py --config "your_config_file" --max_samples 200 --model "model_name"
 ```
+
+
+## PPO Baselines
+We use the [TinyZero](https://github.com/Jiayi-Pan/TinyZero)  repository for PPO experiments.
+
+
+### Usage
+```python
+export N_GPUS=8
+export BASE_MODEL=Qwen/Qwen2.5-3B-Instruct
+export DATA_FILE=data/countdown.json
+export VAL_DATA_FILE=${VAL_DATA_FILE:-$DATA_FILE}
+export ROLLOUT_TP_SIZE=1
+export EXPERIMENT_NAME=countdown-qwen2.5-3b-instruct
+export VLLM_ATTENTION_BACKEND=XFORMERS
+export CHECKPOINT_DIR=/path/to/your/checkpoint/directory
+
+python3 -m verl.trainer.main_ppo \
+ data.train_files=$DATA_FILE \
+ data.val_files=$VAL_DATA_FILE \
+ data.train_batch_size=128 \
+ data.max_prompt_length=1024 \
+ data.max_response_length=1024 \
+ actor_rollout_ref.model.path=$BASE_MODEL \
+ actor_rollout_ref.actor.optim.lr=1e-6 \
+ actor_rollout_ref.model.use_remove_padding=True \
+ +actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
+ +critic.model.fsdp_config.model_dtype=bfloat16 \
+ +actor_rollout_ref.ref.fsdp_config.model_dtype=bfloat16 \
+ actor_rollout_ref.actor.ppo_mini_batch_size=64 \
+ actor_rollout_ref.actor.ppo_micro_batch_size=8 \
+ actor_rollout_ref.rollout.name=vllm \
+ actor_rollout_ref.rollout.log_prob_micro_batch_size=8 \
+ actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP_SIZE \
+ actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+ actor_rollout_ref.ref.log_prob_micro_batch_size=8 \
+ critic.optim.lr=1e-5 \
+ critic.model.path=Qwen/Qwen2.5-0.5B-Instruct \
+ critic.ppo_micro_batch_size=8 \
+ algorithm.kl_ctrl.kl_coef=0.001 \
+ trainer.logger='["console"]' \
+ trainer.n_gpus_per_node=$N_GPUS \
+ trainer.nnodes=1 \
+ trainer.save_freq=100 \
+ trainer.test_freq=100 \
+ trainer.total_epochs=100000 \
+ trainer.default_local_dir=$CHECKPOINT_DIR \
+ trainer.default_hdfs_dir=$CHECKPOINT_DIR \
+ trainer.project_name=$EXPERIMENT_NAME \
+ trainer.experiment_name=$EXPERIMENT_NAME 2>&1 | tee logs/${EXPERIMENT_NAME}.log
+```
