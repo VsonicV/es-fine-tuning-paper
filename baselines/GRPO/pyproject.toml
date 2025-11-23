@@ -1,0 +1,21 @@
+[project]
+name = "GRPO-Zero"
+version = "0.2.0"
+description = "GRPO from scratch."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "jinja2>=3.1.6",
+    "pandas>=2.2.3",
+    "pyarrow>=19.0.1",
+    "pyyaml>=6.0.2",
+    "safetensors>=0.5.3",
+    "tensorboard>=2.19.0",
+    "tokenizers>=0.21.1",
+    "torch>=2.6.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytype>=2024.10.11",
+]
