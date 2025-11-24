@@ -4,6 +4,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 import json
 import time
 import argparse
+import tempfile
 from typing import List, Tuple, Dict, Any
 
 import numpy as np
@@ -302,10 +303,21 @@ def save_results(results: Dict[str, Any], output_dir: str, args):
 def main():
     args = parse_args()
 
+    # no auto connection
     os.environ.pop("RAY_ADDRESS", None)
     os.environ.pop("RAY_HEAD_IP", None)
     os.environ.pop("RAY_GCS_SERVER_ADDRESS", None)
-    ray.init(address="local", include_dashboard=False, ignore_reinit_error=True)
+
+    # This prevents socket/file lock conflicts with other running Ray instances
+    unique_dir = tempfile.mkdtemp(prefix=f"ray_temp_session_{int(time.time())}_")
+
+    ray.init(
+        address="local",
+        include_dashboard=False,
+        ignore_reinit_error=True,
+        _temp_dir=unique_dir, 
+        dashboard_port=None 
+    )
 
     global reward_function
     from countdown.countdown_task import reward_function
