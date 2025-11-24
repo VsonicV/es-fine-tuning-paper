@@ -69,3 +69,13 @@ class WorkerExtension:
             torch.cuda.empty_cache()
         time.sleep(0.1)
         return True
+
+    def load_weights_from_disk(self, filepath):
+        state_dict = torch.load(filepath, map_location=self.device)
+        for name, p in self.model_runner.model.named_parameters():
+            p.data.copy_(state_dict[name].to(self.device))
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        time.sleep(0.1)
+        return True
