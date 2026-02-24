@@ -8,6 +8,7 @@ import shutil
 import signal
 import sys
 import time
+from typing import List, Dict, Any
 
 import numpy as np
 import ray
@@ -42,11 +43,19 @@ def parse_args():
     parser.add_argument("--experiment_dir", type=str, default=EXPERIMENT_DIR)
     parser.add_argument("--cuda_devices", type=str, default="0,1,2,3")
     parser.add_argument('--verbose', action='store_true', help='Print verbose logs')
-    parser.add_argument(
-        "--global_seed",
-        type=int,
-        help="Global random seed",
-    )
+    parser.add_argument("--global_seed", type=int, help="Global random seed")
+    parser.add_argument("--precision", type=str, choices=["float16", "bfloat16", "float32"],
+                        default="float16", help="Precision for model weights")
+
+    # Evaluation args
+    parser.add_argument("--eval_data_path", type=str,
+                        default="countdown/data/countdown.json",
+                        help="Path to evaluation JSON (same schema as train)")
+    parser.add_argument("--eval_interval", type=int, default=25,
+                        help="Evaluate every N iterations (0 disables)")
+    parser.add_argument("--eval_batch_size", type=int, default=512,
+                        help="Batch size for evaluation generation")
+
     args = parser.parse_args()
     # Optional: scope host visibility; vLLM actors will ignore it and pick device from PG
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_devices
@@ -67,7 +76,7 @@ class ESNcclLLM(LLM):
         os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         super().__init__(*args, **kwargs)
 
-def launch_engines(num_engines, model_name):
+def launch_engines(num_engines, model_name, precision="float16"):
     # Strict 1-GPU isolation via PGs
     pgs = [placement_group([{"GPU": 1, "CPU": 0}], lifetime="detached") for _ in range(num_engines)]
     ray.get([pg.ready() for pg in pgs])
@@ -87,7 +96,7 @@ def launch_engines(num_engines, model_name):
             tensor_parallel_size=1,
             distributed_executor_backend="ray",
             worker_extension_cls="utils.worker_extn.WorkerExtension",
-            dtype="float16",
+            dtype=precision,
             enable_prefix_caching=False,
             enforce_eager=False,
         )
@@ -117,6 +126,51 @@ def _postprocess_outputs(outputs, task_datas):
         "rewards": rewards,
         "avg_reward": float(np.mean(avg_rewards)) if avg_rewards else 0.0,
     }
+
+def evaluate_model(llm, eval_task_datas: List[Dict[str, Any]], writer, step: int, args):
+    if not eval_task_datas:
+        return
+    batch_size = max(1, args.eval_batch_size)
+    sampling_params = SamplingParams(temperature=0.0, seed=999, max_tokens=1024)
+
+    all_rewards = []
+    format_rewards = []
+    answer_rewards = []
+    start = time.time()
+
+    for b in range(0, len(eval_task_datas), batch_size):
+        batch = eval_task_datas[b:b+batch_size]
+        prompts = [d["context"] for d in batch]
+        outputs = ray.get(llm.generate.remote(prompts, sampling_params, use_tqdm=False))
+        for out, data in zip(outputs, batch):
+            response = out.outputs[0].text
+            r = reward_function(response, data["numbers"], data["target"])
+            all_rewards.append(r["reward"])
+            if "reward_info" in r:
+                format_rewards.append(r["reward_info"].get("format_reward", 0.0))
+                answer_rewards.append(r["reward_info"].get("answer_reward", 0.0))
+    elapsed = time.time() - start
+
+    avg_reward = float(np.mean(all_rewards)) if all_rewards else 0.0
+    std_reward = float(np.std(all_rewards)) if all_rewards else 0.0
+    min_reward = float(np.min(all_rewards)) if all_rewards else 0.0
+    max_reward = float(np.max(all_rewards)) if all_rewards else 0.0
+    avg_format = float(np.mean(format_rewards)) if format_rewards else 0.0
+    avg_answer = float(np.mean(answer_rewards)) if answer_rewards else 0.0
+    accuracy = (sum(1 for a in answer_rewards if a > 0) / len(answer_rewards) * 100.0) if answer_rewards else 0.0
+
+    print(f"[Eval @ step {step}] avg_reward={avg_reward:.4f} ± {std_reward:.4f} "
+          f"range=[{min_reward:.4f},{max_reward:.4f}] format={avg_format:.4f} "
+          f"answer={avg_answer:.4f} acc={accuracy:.1f}% time={elapsed:.2f}s")
+
+    writer.add_scalar("eval/avg_reward", avg_reward, step)
+    writer.add_scalar("eval/std_reward", std_reward, step)
+    writer.add_scalar("eval/min_reward", min_reward, step)
+    writer.add_scalar("eval/max_reward", max_reward, step)
+    writer.add_scalar("eval/format_reward", avg_format, step)
+    writer.add_scalar("eval/answer_reward", avg_answer, step)
+    writer.add_scalar("eval/accuracy", accuracy, step)
+    writer.add_scalar("eval/time", elapsed, step)
 
 def main(args):
     # Ensure local Ray
@@ -149,14 +203,22 @@ def main(args):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # Load data
+    # Load train data
     data_path = "countdown/data/countdown.json"
     with open(data_path, "r") as f:
         task_datas = json.load(f)
     task_datas = task_datas[:200]
 
+    # Load eval data (same schema)
+    eval_task_datas = []
+    if args.eval_interval > 0 and os.path.exists(args.eval_data_path):
+        with open(args.eval_data_path, "r") as f:
+            # Use the data after 200 for evaluation
+            eval_task_datas = json.load(f)[200:]
+        print(f"Loaded {len(eval_task_datas)} eval samples from {args.eval_data_path}")
+
     # Launch engines
-    engines, pgs = launch_engines(args.num_engines, base_model_path)
+    engines, pgs = launch_engines(args.num_engines, base_model_path, precision=args.precision)
 
     # Init inter-engine communicator once
     master_address = get_ip()
@@ -306,6 +368,14 @@ def main(args):
         writer.add_scalar("time/iteration", total_iter_end - total_iter_start, i)
         print(f"wall clock time for iteration {i}: {total_iter_end - total_iter_start}s")
         print(f"=== Generation {i} finished ===\n")
+
+        # Periodic evaluation using engine 0 (no extra engine)
+        if args.eval_interval > 0 and (i % args.eval_interval == 0 or i == args.num_iterations - 1):
+            evaluate_model(engines[0], eval_task_datas, writer, i, args)
+
+    # Final evaluation if not already at last iteration boundary
+    if args.eval_interval > 0 and (args.num_iterations - 1) % args.eval_interval != 0:
+        evaluate_model(engines[0], eval_task_datas, writer, args.num_iterations, args)
 
     # Save final model weights (all engines are in sync; save from engine 0)
     final_model_path = f"{model_saves_dir}/final_model_iteration_{args.num_iterations}"
