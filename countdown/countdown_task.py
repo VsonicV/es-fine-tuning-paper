@@ -1,9 +1,12 @@
-import re
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+"""
+Utility functions for countdown task
+"""
 
-import pandas as pd
-from torch.utils.data import Dataset
+import re
+from typing import Any
+from typing import Dict
+from typing import List
+from typing import Optional
 
 
 def format_reward_function(response: str, end_token: Optional[str] = None) -> float:
@@ -35,10 +38,8 @@ def format_reward_function(response: str, end_token: Optional[str] = None) -> fl
 
     return reward
 
-def answer_reward_function(
-    response: str, numbers: List[int] = None, target: int = None
-) -> float:
-    # modified
+
+def answer_reward_function(response: str, numbers: List[int] = None, target: int = None) -> float:
     """
     Checks if the last <answer>...</answer> uses all numbers exactly once and evaluates to the target.
     Returns 1.0 if the last one is correct, else 0.0.
@@ -51,12 +52,10 @@ def answer_reward_function(
 
     # Only check the last answer
     answer_content = all_matches[-1]
-    
+
     allowed_chars = r"^[0-9+\-*/() ]+$"
 
-    if not answer_content:
-        return 0.0
-    if not re.match(allowed_chars, answer_content):
+    if not answer_content or not re.match(allowed_chars, answer_content):
         return 0.0
 
     # Check numbers used
@@ -64,12 +63,17 @@ def answer_reward_function(
     if sorted(used_numbers) != sorted(numbers):
         return 0.0
 
-    # Try evaluating
+    # Try evaluating the answer
+    #
+    # Setting __builtins__ to None disables access to all built-in functions and objects, such
+    # as: open, exec, import, print, len, etc. This is a safety measure — to prevent code
+    # injection or unauthorized access.
     try:
-        result = eval(answer_content, {"__builtins__": None}, {})
+        result = eval(answer_content, {"__builtins__": None}, {})  # pylint: disable=eval-used
         if abs(float(result) - float(target)) < 1e-5:
             return 1.0
-    except:
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        print(f"Evaluating {answer_content} resulted in exception {type(e).__name__}: {e}")
         return 0.0
 
     return 0.0
@@ -81,12 +85,14 @@ def reward_function(
     target: int = None,
     end_token: str = None,
 ) -> Dict[str, Any]:
-    """Reward function for Countdown Tasks.
+    """
+    Reward function for Countdown Tasks.
 
     Total reward = 0.1 * format_reward + answer_reward
     """
     format_reward = format_reward_function("<think>" + response, end_token)
     answer_reward = answer_reward_function(response, numbers, target)
+
     return {
         "reward": format_reward * 0.1 + answer_reward,
         "reward_info": {

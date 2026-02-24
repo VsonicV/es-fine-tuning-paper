@@ -1,0 +1,86 @@
+name: Lint
+
+on: [push, pull_request]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13.5"
+
+      - name: Set up virtual environment and install dependencies
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-build.txt
+
+      - name: Run black (code formatter)
+        id: black
+        continue-on-error: true
+        run: |
+          ./venv/bin/black --check --diff .
+
+      - name: Run isort (import sorter)
+        id: isort
+        continue-on-error: true
+        run: |
+          ./venv/bin/isort --check-only --diff .
+
+      - name: Run flake8 (style guide enforcement)
+        id: flake8
+        continue-on-error: true
+        run: |
+          ./venv/bin/flake8 .
+
+      - name: Run pylint (code analysis)
+        id: pylint
+        continue-on-error: true
+        run: |
+          ./venv/bin/pylint $(git ls-files '*.py')
+
+      - name: Run pymarkdownlint (Markdown linting)
+        id: pymarkdownlint
+        continue-on-error: true
+        run: |
+          ./venv/bin/pymarkdown --config ./.pymarkdownlint.yaml scan ./docs/**/*.md ./README.mdsource venv/bin/activate
+
+      - name: Roll up QA results and set final job status
+        if: always()
+        env:
+            STATUS_black: ${{ steps.black.outcome }}
+            STATUS_isort: ${{ steps.isort.outcome }}
+            STATUS_flake8: ${{ steps.flake8.outcome }}
+            STATUS_pylint: ${{ steps.pylint.outcome }}
+            STATUS_pymarkdownlint: ${{ steps.pymarkdownlint.outcome }}
+        run: |
+            failures=()
+            summarize() {
+              step_id="$1"; step_name="$2"
+              status_var="STATUS_${step_id}"
+              status_value="${!status_var:-unknown}"
+              if [ "$status_value" = "failure" ] || [ "$status_value" = "cancelled" ]; then
+                failures+=("$step_name")
+              fi
+                echo "- ${step_name}: ${status_value}" >> "$GITHUB_STEP_SUMMARY"
+            }
+
+            echo "### Quality and Test Results" >> "$GITHUB_STEP_SUMMARY"
+            summarize black "black"
+            summarize isort "isort"
+            summarize flake8 "flake8"
+            summarize pylint "pylint"
+            summarize pymarkdownlint "pymarkdownlint"
+
+            if [ ${#failures[@]} -gt 0 ]; then
+              echo "Failures detected: ${failures[*]}" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
