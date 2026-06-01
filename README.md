@@ -91,6 +91,35 @@ python es_fine-tuning_countdown_accl.py \
 
 On preliminary 4xH100 setting, accelerated version achieves ~10 times speed-up with similar convergence rate.
 
+## Evaluation
+For evaluating the fine-tuned models saved by the accelerated version (using `es_fine-tuning_countdown_accl.py`):
+```bash
+python eval_countdown_vllm.py \
+    --model_id "Qwen/Qwen2.5-3B-Instruct" \
+    --trained_model_path <path to your .pth file save by accl es program> \
+    --eval_data_path "countdown/data/countdown.json" \
+    --eval_samples 2000 \
+    --eval_offset -2000 \
+    --max_new_tokens 1024 \
+    --batch_size 1024 \
+    --save_responses\
+    --show_examples 5
+```
+
+For evaluating the fine-tuned models saved by the original version (using `countdown/es_fine-tuning_countdown.py`):
+```bash
+python countdown/eval_countdown.py \
+    --model_path "${MODEL_PATH}" \
+    --base_model_name "${BASE_MODEL_NAME}" \
+    --eval_data_path "data/countdown.json" \
+    --eval_samples 2000 \
+    --eval_offset -2000 \
+    --max_new_tokens 1024 \
+    --batch_size 500 \
+    --save_responses \
+    --show_examples 5
+```
+
 ## Citation
 
 If you find this work helpful in your research, please cite:
