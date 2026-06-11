@@ -1,0 +1,26 @@
+# Build / install
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Experiments & run outputs
+experiments/
+jobs/
+run*/
+misc/
+
+# HuggingFace dataset cache (cache-* shards are transient; data-* shards are real)
+datasets/**/cache-*.arrow
+datasets/**/*.json.gz
+datasets/**/.cache
+
+# Env
+.venv/
+venv/
+env/

@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#000; display:flex; align-items:center; justify-content:center; min-height:100vh; }
+  canvas { display:block; width:100%; max-width:900px; aspect-ratio:3/1; image-rendering:pixelated; }
+</style>
+</head>
+<body>
+<canvas id="c" width="192" height="64"></canvas>
+<script>
+(function(){
+  const W=192, H=64, D=W*H, N_POP=40, SIGMA0=8, SIGMA_MIN=0.3, LR0=0.06;
+  const BETA1=0.9, BETA2=0.999, EPS=1e-8, N_GEN=3000, SPF=3;
+
+  const target=new Float32Array(D);
+  for(let r=0;r<H;r++) for(let c=0;c<W;c++){
+    const w=(c-W/2)/(W/2), k=(r-H/2)/(H/2), o=Math.sqrt(w*w+k*k);
+    target[r*W+c]=(0.5+0.5*Math.sin(w*6+k*2)*Math.exp(-o*o*1.4))*255;
+  }
+
+  let theta=new Float32Array(D).map(()=>Math.random()*255);
+  let m=new Float32Array(D), v=new Float32Array(D);
+  let best=theta.slice(), bestMse=Infinity, gen=0;
+
+  function randn(){const u=Math.random()||1e-10,vv=Math.random()||1e-10;return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*vv);}
+
+  function step(){
+    if(gen>=N_GEN) return;
+    gen++;
+    const frac=gen/N_GEN;
+    const sigma=SIGMA_MIN+0.5*(SIGMA0-SIGMA_MIN)*(1+Math.cos(Math.PI*frac));
+    const lr=LR0*0.5*(1+Math.cos(Math.PI*frac));
+    const eps=[], diff=new Float32Array(N_POP);
+    for(let i=0;i<N_POP;i++){
+      const e=new Float32Array(D);
+      for(let j=0;j<D;j++) e[j]=randn();
+      eps.push(e);
+      let sp=0,sm=0;
+      for(let j=0;j<D;j++){
+        const p=Math.max(0,Math.min(255,theta[j]+sigma*e[j]));
+        const n=Math.max(0,Math.min(255,theta[j]-sigma*e[j]));
+        sp+=(p-target[j])**2; sm+=(n-target[j])**2;
+      }
+      diff[i]=(sm-sp)/D;
+    }
+    const sorted=[...diff].map((val,i)=>({val,i})).sort((a,b)=>a.val-b.val);
+    const ranks=new Float32Array(N_POP);
+    sorted.forEach(({i},r)=>{ranks[i]=r/(N_POP-1)-0.5;});
+    const grad=new Float32Array(D);
+    for(let i=0;i<N_POP;i++){const ri=ranks[i],ei=eps[i];for(let j=0;j<D;j++) grad[j]+=ri*ei[j];}
+    const bc1=1-Math.pow(BETA1,gen), bc2=1-Math.pow(BETA2,gen), ins=1/(N_POP*sigma);
+    for(let j=0;j<D;j++){
+      grad[j]*=ins;
+      m[j]=BETA1*m[j]+(1-BETA1)*grad[j];
+      v[j]=BETA2*v[j]+(1-BETA2)*grad[j]*grad[j];
+      theta[j]=Math.max(0,Math.min(255,theta[j]+lr*255*(m[j]/bc1)/(Math.sqrt(v[j]/bc2)+EPS)));
+    }
+    let s=0; for(let i=0;i<D;i++){const d=theta[i]-target[i];s+=d*d;}
+    const mse=s/D;
+    if(mse<bestMse){bestMse=mse;best=theta.slice();}
+  }
+
+  const ctx=document.getElementById('c').getContext('2d');
+  function render(){
+    const id=ctx.createImageData(W,H);
+    for(let i=0;i<D;i++){const val=Math.max(0,Math.min(255,best[i]|0));id.data[i*4]=val;id.data[i*4+1]=val;id.data[i*4+2]=val;id.data[i*4+3]=255;}
+    ctx.putImageData(id,0,0);
+  }
+
+  function loop(){
+    for(let s=0;s<SPF&&gen<N_GEN;s++) step();
+    render();
+    if(gen<N_GEN) requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
