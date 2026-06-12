@@ -18,9 +18,9 @@ Training is built on **Ray** for distributed execution and **vLLM** for high-thr
 
 ---
 
-## 🎉 What's New
+<!-- ## 🎉 What's New
 
----
+--- -->
 
 ## At a glance
 
