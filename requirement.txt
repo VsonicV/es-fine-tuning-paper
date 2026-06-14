@@ -1,5 +1,0 @@
-transformers>=4.30.0
-accelerate>=0.20.0
-numpy>=1.21.0
-psutil>=5.8.0
-pandas>=2.3.0
