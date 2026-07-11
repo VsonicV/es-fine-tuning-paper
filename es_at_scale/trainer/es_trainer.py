@@ -7,36 +7,21 @@ import sys
 import time
 import numpy as np
 
-import ray
-from ray.util.placement_group import placement_group, remove_placement_group
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-
-from vllm import LLM, SamplingParams
-from vllm.utils import get_ip, get_open_port
-from transformers import AutoTokenizer
-
-
 import torch
 import json
 
-from typing import List
 from multiprocessing import Pool, TimeoutError
 import functools
 
+from es_at_scale.backends import SamplingConfig
 from es_at_scale.utils.reward_shaping import z_score
-
-
-class ESNcclLLM(LLM):
-    def __init__(self, *args, **kwargs):
-        #os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-        super().__init__(*args, **kwargs)
 
 
 class EvolutionStrategiesTrainer:
     def __init__(
         self,
-        model_name,           # HuggingFace model ID or local path, e.g. "Qwen/Qwen2.5-Math-7B"
+        backend,              # An ESBackend instance (vLLM/SGLang/...). Owns the inference engines.
+        model_name,           # HuggingFace model ID or local path; used here only for the tokenizer.
         checkpoint,           # Path to a .pth ES checkpoint to resume from, or None to start fresh
         sigma,                # Noise scale: std dev of Gaussian perturbations applied to weights
         alpha,                # Learning rate: controls how far we move in the estimated gradient direction
@@ -51,10 +36,7 @@ class EvolutionStrategiesTrainer:
         train_dataloader,     # PyTorch DataLoader yielding (list[prompt], list[target]) batches
         eval_dataloader_dict, # Dict[task_name, DataLoader] of evaluation sets; all are run at eval_freq
         eval_freq,            # Run evaluation every this many training iterations
-        n_vllm_engines,       # Number of vLLM engine actors to launch (one per GPU is typical)
-        n_gpu_per_vllm_engine,# GPUs assigned to each vLLM engine (use >1 for tensor-parallel large models)
         logging,              # Logging backend: "wandb" to enable W&B tracking, or "none"
-        use_gpus,             # Comma-separated GPU indices visible to this process, e.g. "0,1,2,3"
         global_seed=None,     # Master random seed for reproducible perturbation sequences
         output_directory=None,# Root directory for experiment outputs (checkpoints, eval logs)
         save_best_models=True,# If True, save a checkpoint whenever a new best eval score is achieved, final model is always saved to disk upon training completion
@@ -63,14 +45,7 @@ class EvolutionStrategiesTrainer:
         reward_function_timeout=60  # Seconds before a reward function call is killed and assigned 0.0
 
     ):
-        # GPU init
-        os.environ["CUDA_VISIBLE_DEVICES"] = use_gpus
-        # Ray init
-        os.environ.pop("RAY_ADDRESS", None)
-        os.environ.pop("RAY_HEAD_IP", None)
-        os.environ.pop("RAY_GCS_SERVER_ADDRESS", None)
-
-        ray.init(address="local", include_dashboard=False, ignore_reinit_error=True)
+        self.backend = backend
 
         signal.signal(signal.SIGINT, lambda sig, frame: self._handle_exit(sig, frame))
         signal.signal(signal.SIGTERM, lambda sig, frame: self._handle_exit(sig, frame))
@@ -86,8 +61,6 @@ class EvolutionStrategiesTrainer:
         self.max_tokens = max_tokens
         self.batch_size = batch_size
         self.mini_batch_size = mini_batch_size
-        self.n_vllm_engines = n_vllm_engines
-        self.n_gpu_per_vllm_engine = n_gpu_per_vllm_engine
         self.eval_freq = eval_freq
         self.logging = logging
         self.global_seed = global_seed
@@ -153,40 +126,16 @@ class EvolutionStrategiesTrainer:
             self.wandb.define_metric("train/*", step_metric="global_step")
             self.wandb.define_metric("eval/*", step_metric="global_step")
 
+        from transformers import AutoTokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         self.best_member = -np.inf
 
-        torch.cuda.empty_cache()
-        gc.collect()
+        # Start persistent engines (backend owns GPU placement and weight ops).
+        self.backend.start()
 
-        # Start persistent engines
-        self.engines, self.pgs = self.launch_engines(
-            num_engines=self.n_vllm_engines, 
-            n_gpu_per_vllm_engine=self.n_gpu_per_vllm_engine, 
-            model_name=self.model_name
-        )
-
-        master_address = get_ip()
-        master_port = get_open_port()
-        ray.get(
-            [
-                self.engines[i].collective_rpc.remote(
-                    "init_inter_engine_group",
-                    args=(master_address, master_port, i, self.n_vllm_engines),
-                )
-                for i in range(self.n_vllm_engines)
-            ]
-        )
         if self.checkpoint is not None:
             print("Loading checkpoint weights")
-            ray.get(
-                [
-                    self.engines[i].collective_rpc.remote(
-                        "load_weights_from_disk", args=(self.checkpoint,)
-                    )
-                    for i in range(self.n_vllm_engines)
-                ]
-            )
+            self.backend.load(self.checkpoint)
             print("Completed loading checkpoint weights")
 
         self.eval_cache = {}  # name -> (prompts, targets)
@@ -199,17 +148,11 @@ class EvolutionStrategiesTrainer:
                 break
 
     def cleanup(self):
-        """Gracefully terminate all Ray actors and placement groups."""
-        for llm in self.engines:
-            try:
-                ray.kill(llm)
-            except Exception:
-                pass
-        for pg in self.pgs:
-            try:
-                remove_placement_group(pg)
-            except Exception:
-                pass
+        """Gracefully terminate all engines owned by the backend."""
+        try:
+            self.backend.shutdown()
+        except Exception:
+            pass
         print("[INFO] Cleanup complete.")
 
     def _handle_exit(self, sig, frame):
@@ -217,45 +160,6 @@ class EvolutionStrategiesTrainer:
         print(f"[INFO] Received signal {sig}, cleaning up...")
         self.cleanup()
         sys.exit(0)
-
-    def launch_engines(
-        self, num_engines=4, n_gpu_per_vllm_engine=1, model_name="Qwen/Qwen2.5-Math-1.5B", precision="bfloat16"
-    ):
-        pgs = [
-            placement_group(
-                [{"GPU": 1, "CPU": 0}] * n_gpu_per_vllm_engine, 
-                strategy="PACK",
-                lifetime="detached")
-            for _ in range(num_engines)
-        ]
-        ray.get([pg.ready() for pg in pgs])
-
-        strategies = [
-            PlacementGroupSchedulingStrategy(
-                placement_group=pg,
-                placement_group_capture_child_tasks=True,
-                placement_group_bundle_index=0,
-            )
-            for pg in pgs
-        ]
-
-        engines = [
-            ray.remote(num_cpus=0, num_gpus=0, scheduling_strategy=strategy)(
-                ESNcclLLM
-            ).remote(
-                model=model_name,
-                tensor_parallel_size=n_gpu_per_vllm_engine,
-                distributed_executor_backend="ray",
-                worker_extension_cls="es_at_scale.utils.worker_extension.WorkerExtension",
-                dtype=precision,
-                enable_prefix_caching=False,
-                enforce_eager=False,
-                gpu_memory_utilization=0.7,
-            )
-            for strategy in strategies
-        ]
-        return engines, pgs
-
 
     def _postprocess_outputs(self, generated_text, target_text, eval=False):
         rewards_per_prompt, gen_lens_per_prompt, save, raw_rewards_per_prompt, raw_lens_per_prompt, = [], [], [], [], []
@@ -278,6 +182,7 @@ class EvolutionStrategiesTrainer:
                     fmt, r = res.get(timeout=self.reward_function_timeout)
                     rollout_rewards.append(float(r))
                 except TimeoutError:
+                    fmt, r = None, 0.0
                     rollout_rewards.append(0.0)
 
                 rollout_lens.append(int(gen_len))
@@ -323,12 +228,10 @@ class EvolutionStrategiesTrainer:
             "n_samples": int(self.n_samples),
         }
 
-
     def train_step(self, iteration, seeds, input_text, target_text):
 
-        sampling_params = SamplingParams(
+        sampling = SamplingConfig(
             n=self.n_samples,
-            # sampling seed tied to iteration
             seed=(self.global_seed or 42) + iteration,
             temperature=self.train_temperature,
             top_p=self.train_top_p,
@@ -360,7 +263,7 @@ class EvolutionStrategiesTrainer:
                 seeds,
                 input_batch,
                 target_batch,
-                sampling_params,
+                sampling,
             )
 
             all_results_this_gen.extend(results_this_gen)
@@ -427,25 +330,10 @@ class EvolutionStrategiesTrainer:
             for seed in seeds
         ]
 
-        ray.get(
-            self.engines[0].collective_rpc.remote(
-                "update_weights_from_seeds",
-                args=(
-                    seeds,
-                    coeffs,
-                    self.alpha,
-                    self.population_size,
-                ),
-            )
+        # Commit the ES update and leave every engine at the identical new theta.
+        self.backend.sync_after_update(
+            seeds, coeffs, self.alpha, self.population_size
         )
-
-        ray.get(
-            [
-                e.collective_rpc.remote("broadcast_all_weights", args=(0,))
-                for e in self.engines
-            ]
-        )
-        torch.cuda.synchronize()
 
     def _iter_minibatches(self, input_text, target_text, mini_batch_size: int):
         n = len(input_text)
@@ -453,39 +341,36 @@ class EvolutionStrategiesTrainer:
             end = start + mini_batch_size
             yield input_text[start:end], target_text[start:end]
 
-    def evaluate_handle(self, llm, input_text, sampling_params):
-        handle = llm.generate.remote(input_text, sampling_params, use_tqdm=False)
-        return handle
-
     def evaluate_population_on_batch(
         self,
         seeds,
         input_batch,
         target_batch,
-        sampling_params,
+        sampling,
     ):
         seeds_perf_batch = {}
         results_this_gen = []
 
+        n_engines = self.backend.num_engines
         # Static batching -- issue exactly one seed per engine per batch in fixed order, then wait
-        for b in range(0, len(seeds), self.n_vllm_engines):
-            engine_batch = seeds[b:b+self.n_vllm_engines]
+        for b in range(0, len(seeds), n_engines):
+            engine_batch = seeds[b:b + n_engines]
             # 1) Perturb the model weights
-            ray.get([
-                self.engines[eng_idx].collective_rpc.remote("perturb_self_weights", args=(int(seed), self.sigma, False))
+            self.backend.wait([
+                self.backend.perturb_async(eng_idx, int(seed), self.sigma)
                 for eng_idx, seed in enumerate(engine_batch)
             ])
 
             # 2) Generate with fixed generation seed tied to the current iteration
-            handles = [
-                self.evaluate_handle(self.engines[eng_idx], input_batch, sampling_params=sampling_params)
-                for eng_idx, _ in enumerate(engine_batch)
+            gen_handles = [
+                self.backend.generate_async(eng_idx, input_batch, sampling)
+                for eng_idx in range(len(engine_batch))
             ]
             # 3) Collect outputs in the same order
-            outputs_per_engine = ray.get(handles)
+            outputs_per_engine = self.backend.wait(gen_handles)
             # 4) Restore weights
-            ray.get([
-                self.engines[eng_idx].collective_rpc.remote("restore_self_weights", args=(int(seed), self.sigma))
+            self.backend.wait([
+                self.backend.restore_async(eng_idx, int(seed), self.sigma)
                 for eng_idx, seed in enumerate(engine_batch)
             ])
             # 5) Score and record
@@ -500,12 +385,11 @@ class EvolutionStrategiesTrainer:
                         }
                     )
 
-        return seeds_perf_batch, results_this_gen        
+        return seeds_perf_batch, results_this_gen
 
     def eval_step(self, iteration):
         to_log = {"eval-iteration": iteration}
         mean_eval_results = []
-        llm = self.engines[0]
 
         for name, eval_loader in self.eval_dataloader_dict.items():
             # Accumulate per-prompt reward sum and prompt count so the dataset
@@ -518,7 +402,7 @@ class EvolutionStrategiesTrainer:
             for input_text, target_text in eval_loader:
                 input_text = [self.template(i) for i in input_text]
 
-                sampling_params = SamplingParams(
+                sampling = SamplingConfig(
                     n=1,
                     seed=(self.global_seed or 42) + iteration,
                     temperature=0.0,
@@ -526,13 +410,9 @@ class EvolutionStrategiesTrainer:
                     max_tokens=self.max_tokens,
                 )
 
-                outputs = ray.get(
-                                    llm.generate.remote(
-                                        input_text,
-                                        sampling_params,
-                                        use_tqdm=False
-                                    )
-                                )
+                outputs = self.backend.wait(
+                    [self.backend.generate_async(0, input_text, sampling)]
+                )[0]
 
                 metrics = self._postprocess_outputs(outputs, target_text, eval=True)
 
@@ -574,12 +454,7 @@ class EvolutionStrategiesTrainer:
                     f"{self.logging_dir}/checkpoints/{self.experiment_name}-mean{float(np.mean(mean_eval_results))}"
                 )
                 os.makedirs(model_path, exist_ok=True)
-                ray.get(
-                    self.engines[0].collective_rpc.remote(
-                        "save_self_weights_to_disk",
-                        args=(f"{model_path}/pytorch_model.pth",),
-                    )
-                )
+                self.backend.save(f"{model_path}/pytorch_model.pth")
 
     def fit(self):
         iteration, epoch = 0, 0
@@ -604,7 +479,7 @@ class EvolutionStrategiesTrainer:
             for input_text, target_text in self.train_dataloader:
                 input_text = [self.template(i) for i in input_text]
                 print(f"\n\n=== Epoch {epoch+1}; Iteration {iteration+1} ===")
-                total_iter_start = time.time()                
+                total_iter_start = time.time()
 
                 # Deterministic per-iteration seed list
                 loop_rng = np.random.default_rng(seed=(self.global_seed or 42) + iteration)
@@ -629,19 +504,14 @@ class EvolutionStrategiesTrainer:
                 if iteration > self.num_iterations:
                     done = True
                     break
-            
+
             epoch += 1
             if done:
                 break
 
         final_model_path = f"{self.logging_dir}/checkpoint-es_fine_tuned_iteration_{self.num_iterations}"
         os.makedirs(final_model_path, exist_ok=True)
-        ray.get(
-            self.engines[0].collective_rpc.remote(
-                "save_self_weights_to_disk",
-                args=(f"{final_model_path}/pytorch_model.pth",),
-            )
-        )
+        self.backend.save(f"{final_model_path}/pytorch_model.pth")
         print(f"Final model weights saved to {final_model_path}.")
 
         self.cleanup()

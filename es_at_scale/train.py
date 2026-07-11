@@ -81,6 +81,14 @@ def main():
                         help="Experiment name for logging and checkpoints. Auto-generated from hyperparams if not set.")
     parser.add_argument("--wandb-project", type=str, default="es-finetuning")
 
+    parser.add_argument("--backend", type=str, default="vllm", choices=["vllm", "sglang"],
+                        help="Inference backend for rollouts and ES weight ops.")
+    parser.add_argument("--dtype", type=str, default="bfloat16")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.7,
+                        help="vLLM gpu_memory_utilization / SGLang mem_fraction_static.")
+    parser.add_argument("--sglang-python", type=str, default=None,
+                        help="Path to the SGLang env python (else $ES_SGLANG_PYTHON); only for --backend sglang.")
+
     args = parser.parse_args()
     print(args)
 
@@ -139,7 +147,35 @@ def main():
 
     print(f"-- Running: {experiment_name} --")
 
+    from es_at_scale.backends import get_backend
+
+    if args.backend == "vllm":
+        backend = get_backend(
+            "vllm",
+            model_name=args.model_name,
+            n_engines=args.n_vllm_engines,
+            n_gpu_per_engine=args.n_gpu_per_vllm_engine,
+            dtype=args.dtype,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            seed=args.seed,
+            use_gpus=args.use_gpus,
+        )
+    else:
+        gpu_ids = [int(x) for x in args.use_gpus.split(",") if x != ""]
+        backend = get_backend(
+            "sglang",
+            model_name=args.model_name,
+            n_engines=args.n_vllm_engines,
+            gpus=gpu_ids,
+            n_gpu_per_engine=args.n_gpu_per_vllm_engine,
+            dtype=args.dtype,
+            mem_fraction_static=args.gpu_memory_utilization,
+            seed=args.seed,
+            sglang_python=args.sglang_python,
+        )
+
     trainer = EvolutionStrategiesTrainer(
+        backend=backend,
         model_name=args.model_name,
         checkpoint=args.checkpoint,
         sigma=args.sigma,
@@ -155,18 +191,13 @@ def main():
         train_dataloader=train_dataloader,
         eval_dataloader_dict=eval_dataloader_dict,
         eval_freq=args.eval_freq,
-        n_vllm_engines=args.n_vllm_engines,
-        n_gpu_per_vllm_engine=args.n_gpu_per_vllm_engine,
         logging=args.logging,
         global_seed=args.seed,
-        use_gpus=args.use_gpus,
         experiment_name=experiment_name,
         wandb_project=args.wandb_project,
         save_best_models=args.save_best_models,
         reward_function_timeout=args.reward_function_timeout,
-        output_directory=args.output_directory
-        
-
+        output_directory=args.output_directory,
     )
 
     trainer.fit()
