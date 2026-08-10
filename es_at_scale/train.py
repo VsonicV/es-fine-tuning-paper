@@ -55,6 +55,8 @@ def main():
                         help="Selects reward function, prompt template, and dataset loader.")
     parser.add_argument("--model-name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--checkpoint", type=str)
+    parser.add_argument("--start-iteration", type=int, default=0,
+                        help="Iteration number to resume counting/seeding from (use with --checkpoint to continue a prior run smoothly).")
     parser.add_argument("--sigma", type=float, default=0.001)
     parser.add_argument("--alpha", type=float, default=-1)
     parser.add_argument("--reward-shaping", type=str, default="z-scores")
@@ -164,8 +166,8 @@ def main():
         wandb_project=args.wandb_project,
         save_best_models=args.save_best_models,
         reward_function_timeout=args.reward_function_timeout,
-        output_directory=args.output_directory
-        
+        output_directory=args.output_directory,
+        start_iteration=args.start_iteration,
 
     )
 

@@ -80,7 +80,8 @@ class EvolutionStrategiesTrainer:
         save_best_models=True,# If True, save a checkpoint whenever a new best eval score is achieved, final model is always saved to disk upon training completion
         experiment_name=None, # Human-readable run name used in W&B and checkpoint paths; auto-generated if None
         wandb_project=None,   # W&B project to log to; only used when logging="wandb"
-        reward_function_timeout=60  # Seconds before a reward function call is killed and assigned 0.0
+        reward_function_timeout=60,  # Seconds before a reward function call is killed and assigned 0.0
+        start_iteration=0,    # Iteration number to resume counting/seeding from when loading a checkpoint
 
     ):
         # GPU init
@@ -113,6 +114,7 @@ class EvolutionStrategiesTrainer:
         self.global_seed = global_seed
         self.output_directory = output_directory
         self.save_best_models = save_best_models
+        self.start_iteration = start_iteration
 
         self.train_dataloader = train_dataloader
         self.eval_dataloader_dict = eval_dataloader_dict
@@ -611,7 +613,7 @@ class EvolutionStrategiesTrainer:
                 )
 
     def fit(self):
-        iteration, epoch = 0, 0
+        iteration, epoch = self.start_iteration, 0
         done = False
 
         self.eval_step(iteration=iteration)
