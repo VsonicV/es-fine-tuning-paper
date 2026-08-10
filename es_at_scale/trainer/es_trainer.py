@@ -12,7 +12,10 @@ from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from vllm import LLM, SamplingParams
-from vllm.utils import get_ip, get_open_port
+try:
+    from vllm.utils.network_utils import get_ip, get_open_port  # vLLM >= 0.20ish
+except ImportError:
+    from vllm.utils import get_ip, get_open_port  # vLLM 0.11.0 (pinned by this repo)
 from transformers import AutoTokenizer
 
 
