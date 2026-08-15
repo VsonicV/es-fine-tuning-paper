@@ -1,26 +1,62 @@
-# Build / install
+# Local / personal (never push)
+.notes/
+config.local.toml
+.cursor/
+
+# Runtime artifacts
+runs/
+logs/
+*.log
+*.nohup.out
+outputs/
+checkpoints/
+/experiments/
+*.safetensors
+*.pth
+*.bin
+*.pt
+
+# Downloaded training data (regenerate: python -m es_capacity.cli.fetch_train_data)
+# README.md + SHA256 stay committed so the download stays verifiable.
+data/simplerl_*/train.jsonl
+
+# Model / HF caches
+.hf_cache/
+.cache/
+huggingface/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
 *.egg-info/
+.eggs/
 dist/
 build/
 *.egg
-
-# Python cache
-__pycache__/
-*.pyc
-*.pyo
-
-# Experiments & run outputs
-experiments/
-jobs/
-run*/
-misc/
-
-# HuggingFace dataset cache (cache-* shards are transient; data-* shards are real)
-datasets/**/cache-*.arrow
-datasets/**/*.json.gz
-datasets/**/.cache
-
-# Env
 .venv/
 venv/
-env/
+.env
+.env.*
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Coverage / test
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Wandb
+wandb/
