@@ -280,7 +280,17 @@ class EvolutionStrategiesTrainer:
                 dtype=precision,
                 enable_prefix_caching=False,
                 enforce_eager=False,
-                gpu_memory_utilization=0.7,
+                gpu_memory_utilization=float(
+                    os.environ.get("ES_VLLM_GPU_MEM_UTIL", "0.7")
+                ),
+                # Unset by default -> vLLM uses the model's own max_model_len.
+                # On small-VRAM cards the KV cache cannot hold that (Qwen2.5's
+                # 131072) and vLLM refuses to start; cap it at prompt+max_tokens.
+                **(
+                    {"max_model_len": int(os.environ["ES_VLLM_MAX_MODEL_LEN"])}
+                    if os.environ.get("ES_VLLM_MAX_MODEL_LEN")
+                    else {}
+                ),
                 engine_idx=idx,
             )
             ray.get(engine.collective_rpc.remote("_set_seed", args=(0,)))
