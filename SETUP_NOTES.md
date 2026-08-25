@@ -96,7 +96,7 @@ installed) — so it's unknown whether 0.11.0 strictly needs it. It adds
 of parallel) versus a run that lasts hours to days — negligible cost either
 way, so it wasn't worth the risk of re-testing without it. Fine to leave as-is.
 
-### 4. `gpu_memory_utilization` — kept at `0.7`
+### 4. `gpu_memory_utilization` — default `0.7`, now overridable
 Tested `0.85` (more KV cache headroom) — identical wall-clock time to `0.7`
 on the same workload (384.5s vs 384.7s for 1024 prompts @ max_tokens=4096).
 Confirms the workload is compute-bound, not memory-bound, in this regime.
@@ -104,6 +104,38 @@ Reverted to `0.7` since `0.85` gave no benefit and left less headroom for the
 ES-specific weight-perturbation/broadcast tensors (which allocate outside
 vLLM's own memory budget — see `worker_extension.py`'s `perturb_self_weights`
 etc., each does raw `torch.randn` per parameter tensor).
+
+**Update — this is now `ES_VLLM_GPU_MEM_UTIL`, default unchanged at `0.7`.** The
+paragraph above holds on 48GB cards. It does not hold on small-VRAM GPUs, where
+`0.7` is not survivable at all: the headroom it leaves is smaller than what the
+ES weight update needs.
+
+`update_weights_from_seeds` holds three tensors live at once for each parameter —
+an fp32 accumulator, the bf16 noise, and `noise.to(torch.float32) * coeffs[i]`.
+On Qwen2.5-1.5B's tied `151936x1536` embedding that peaks at **~2.2GB** for that
+one parameter, and it OOMs at `worker_extension.py:121` *after generation has
+already succeeded*, which makes it look like a training bug rather than a
+budgeting one.
+
+Two env knobs, both defaulting to the previous behaviour so nothing changes on
+the boxes this file was written for:
+
+| var | default | when to set it |
+|---|---|---|
+| `ES_VLLM_GPU_MEM_UTIL` | `0.7` | lower it until `total - vLLM budget` exceeds ~2.5GB |
+| `ES_VLLM_MAX_MODEL_LEN` | unset (model's own) | set to `max_prompt + max_tokens` when the KV cache cannot hold the model's full context |
+
+The second is not optional once the first is lowered: Qwen2.5's own
+`max_model_len` is **131072**, and below roughly `0.55` on a 12GB card the KV
+cache can no longer hold it, so vLLM refuses to start rather than degrading.
+
+Verified on 8x RTX 3060 12GB with `0.6` / `4096`: 2.63GiB and 98,352 tokens of
+KV cache per engine, two training iterations, checkpoint written.
+
+**Peak is reducible if this ever becomes binding on a larger model.**
+`update_accumulator.add_(noise, alpha=coeffs[i])` would drop the separate fp32
+`term` and cut ~892MiB off the peak. Left alone deliberately — it changes the
+accumulation numerics, which is a training-math decision, not a memory fix.
 
 ### 5. `start_iteration` param (feature, not a bug fix)
 Added to `__init__` (default `0`) and used in `fit()`:
