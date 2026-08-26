@@ -169,9 +169,9 @@ class WorkerExtension:
         print(f"Model weights saved to {filepath}.")
 
     def load_weights_from_disk(self, filepath):
-        state_dict = torch.load(filepath, map_location=self.device)
+        state_dict = torch.load(filepath, map_location="cpu")
         for name, p in self.model_runner.model.named_parameters():
-            p.data.copy_(state_dict[name].to(self.device))
+            p.data.copy_(state_dict[name])
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

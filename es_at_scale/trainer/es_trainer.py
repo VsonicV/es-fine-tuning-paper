@@ -12,7 +12,10 @@ from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from vllm import LLM, SamplingParams
-from vllm.utils import get_ip, get_open_port
+try:
+    from vllm.utils.network_utils import get_ip, get_open_port  # vLLM >= 0.20ish
+except ImportError:
+    from vllm.utils import get_ip, get_open_port  # vLLM 0.11.0 (pinned by this repo)
 from transformers import AutoTokenizer
 
 
@@ -27,9 +30,26 @@ from es_at_scale.utils.reward_shaping import z_score
 
 
 class ESNcclLLM(LLM):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, engine_idx=0, **kwargs):
         #os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        # Co-located single-GPU engines otherwise all resolve VLLM_DP_MASTER_PORT/
+        # VLLM_DP_RANK_LOCAL to 0 (unset -> vllm.envs default), so every engine
+        # computes the same TCPStore port and only the first one to bind wins.
+        os.environ["VLLM_DP_MASTER_PORT"] = str(29500 + int(engine_idx) * 100)
+        # Same reasoning for the torch.compile cache: identical model/config on
+        # every engine hashes to the same cache path, so concurrent compiles from
+        # co-located engines race on the same files (seen as spurious CUDA
+        # "invalid argument" errors during profiling). Give each its own tree.
+        default_cache_root = os.environ.get("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm"))
+        os.environ["VLLM_CACHE_ROOT"] = os.path.join(default_cache_root, f"engine_{engine_idx}")
+        # Triton's own kernel cache (~/.triton/cache by default) is a separate
+        # cache from VLLM_CACHE_ROOT and races the same way if left shared.
+        default_triton_cache = os.environ.get("TRITON_CACHE_DIR", os.path.expanduser("~/.triton/cache"))
+        os.environ["TRITON_CACHE_DIR"] = os.path.join(os.path.dirname(default_triton_cache.rstrip("/")), f"engine_{engine_idx}_cache")
+        # And the NVIDIA driver's own PTX->SASS JIT cache (~/.nv/ComputeCache),
+        # a third independent shared cache with the same race potential.
+        os.environ["CUDA_CACHE_PATH"] = os.path.expanduser(f"~/.nv/ComputeCache_engine_{engine_idx}")
         super().__init__(*args, **kwargs)
 
 
@@ -60,7 +80,8 @@ class EvolutionStrategiesTrainer:
         save_best_models=True,# If True, save a checkpoint whenever a new best eval score is achieved, final model is always saved to disk upon training completion
         experiment_name=None, # Human-readable run name used in W&B and checkpoint paths; auto-generated if None
         wandb_project=None,   # W&B project to log to; only used when logging="wandb"
-        reward_function_timeout=60  # Seconds before a reward function call is killed and assigned 0.0
+        reward_function_timeout=60,  # Seconds before a reward function call is killed and assigned 0.0
+        start_iteration=0,    # Iteration number to resume counting/seeding from when loading a checkpoint
 
     ):
         # GPU init
@@ -93,6 +114,7 @@ class EvolutionStrategiesTrainer:
         self.global_seed = global_seed
         self.output_directory = output_directory
         self.save_best_models = save_best_models
+        self.start_iteration = start_iteration
 
         self.train_dataloader = train_dataloader
         self.eval_dataloader_dict = eval_dataloader_dict
@@ -239,8 +261,16 @@ class EvolutionStrategiesTrainer:
             for pg in pgs
         ]
 
-        engines = [
-            ray.remote(num_cpus=0, num_gpus=0, scheduling_strategy=strategy)(
+        # Engines are constructed one at a time (not fired off concurrently):
+        # co-located engines doing torch.compile/CUDA-graph capture at the same
+        # moment intermittently corrupt each other's compilation with spurious
+        # "CUDA driver error: invalid argument" failures, even with per-engine
+        # cache directories. Waiting for each engine's __init__ (via a cheap
+        # collective_rpc round trip, which queues behind __init__ in Ray's
+        # per-actor task order) before starting the next avoids the race.
+        engines = []
+        for idx, strategy in enumerate(strategies):
+            engine = ray.remote(num_cpus=0, num_gpus=0, scheduling_strategy=strategy)(
                 ESNcclLLM
             ).remote(
                 model=model_name,
@@ -250,10 +280,21 @@ class EvolutionStrategiesTrainer:
                 dtype=precision,
                 enable_prefix_caching=False,
                 enforce_eager=False,
-                gpu_memory_utilization=0.7,
+                gpu_memory_utilization=float(
+                    os.environ.get("ES_VLLM_GPU_MEM_UTIL", "0.7")
+                ),
+                # Unset by default -> vLLM uses the model's own max_model_len.
+                # On small-VRAM cards the KV cache cannot hold that (Qwen2.5's
+                # 131072) and vLLM refuses to start; cap it at prompt+max_tokens.
+                **(
+                    {"max_model_len": int(os.environ["ES_VLLM_MAX_MODEL_LEN"])}
+                    if os.environ.get("ES_VLLM_MAX_MODEL_LEN")
+                    else {}
+                ),
+                engine_idx=idx,
             )
-            for strategy in strategies
-        ]
+            ray.get(engine.collective_rpc.remote("_set_seed", args=(0,)))
+            engines.append(engine)
         return engines, pgs
 
 
@@ -582,7 +623,7 @@ class EvolutionStrategiesTrainer:
                 )
 
     def fit(self):
-        iteration, epoch = 0, 0
+        iteration, epoch = self.start_iteration, 0
         done = False
 
         self.eval_step(iteration=iteration)
